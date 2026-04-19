@@ -121,7 +121,7 @@ export default function register(api: any): void {
    * A heartbeat wake is requested so the agent processes them promptly
    * (instead of waiting for the next scheduled heartbeat).
    */
-  function deliverToAgent(sessionId: string, messages: Message[]): void {
+  function deliverToAgent(batch: Map<string, Message[]>): void {
     const enqueue = api.runtime?.system?.enqueueSystemEvent;
     const wake = api.runtime?.system?.requestHeartbeatNow;
 
@@ -132,39 +132,65 @@ export default function register(api: any): void {
       return;
     }
 
-    const label = sessionLabels.get(sessionId) ?? sessionId.slice(0, 8);
+    const filtered = new Map<string, Message[]>();
+    for (const [sessionId, messages] of batch) {
+      const agentMessages = messages.filter((m) => m.agentId !== "system");
+      if (agentMessages.length > 0) {
+        filtered.set(sessionId, agentMessages);
+      }
+    }
 
-    // Filter out server system messages (greetings, cron hints, leave notices,
-    // session restore warnings). All have agentId === "system".
-    const agentMessages = messages.filter((m) => m.agentId !== "system");
-    if (agentMessages.length === 0) return;
+    if (filtered.size === 0) return;
 
-    // Resolve the delivery session key for this Nexus session.
-    // Priority: session-level deliverTo > plugin-level agentSessionKey
-    const sessionConfig = allSessions.find((s) => s.id === sessionId);
-    const deliveryKey = resolveDeliverySessionKey(sessionConfig, api) ?? agentSessionKey;
+    const sessionKeys = new Map<string, string>();
+    for (const sessionId of filtered.keys()) {
+      const sessionConfig = allSessions.find((s) => s.id === sessionId);
+      sessionKeys.set(
+        sessionId,
+        resolveDeliverySessionKey(sessionConfig, api) ?? agentSessionKey,
+      );
+    }
 
-    // Batch all messages into a single system event to avoid flooding
-    // the agent with multiple heartbeat wakes per poll cycle.
-    const lines = agentMessages.map((m) => `${m.agentId}: ${m.text}`);
-    const header = agentMessages.length === 1
-      ? `[NexusMessaging:${label}] New message (session: ${sessionId})`
-      : `[NexusMessaging:${label}] ${agentMessages.length} new messages (session: ${sessionId})`;
-    const eventText = `${header}\n${lines.join("\n")}`;
+    const firstDeliveryKey = sessionKeys.values().next().value as string;
+    let eventText: string;
+    let contextKey: string;
+
+    if (filtered.size === 1) {
+      const [sessionId, agentMessages] = filtered.entries().next().value as [string, Message[]];
+      const label = sessionLabels.get(sessionId) ?? sessionId.slice(0, 8);
+      const lines = agentMessages.map((m) => `${m.agentId}: ${m.text}`);
+      const header = agentMessages.length === 1
+        ? `[NexusMessaging:${label}] New message (session: ${sessionId})`
+        : `[NexusMessaging:${label}] ${agentMessages.length} new messages (session: ${sessionId})`;
+      eventText = `${header}\n${lines.join("\n")}`;
+      contextKey = `nexus:${sessionId}`;
+    } else {
+      const parts: string[] = [];
+      let totalMessages = 0;
+      for (const [sessionId, agentMessages] of filtered) {
+        totalMessages += agentMessages.length;
+        const label = sessionLabels.get(sessionId) ?? sessionId.slice(0, 8);
+        const lines = agentMessages.map((m) => `${m.agentId}: ${m.text}`);
+        parts.push(`📨 ${label} (session: ${sessionId}) — ${agentMessages.length} message${agentMessages.length === 1 ? "" : "s"}\n${lines.join("\n")}`);
+      }
+      const header = `[NexusMessaging] ${totalMessages} new messages across ${filtered.size} sessions`;
+      eventText = `${header}\n\n${parts.join("\n\n")}`;
+      contextKey = "nexus:batch";
+    }
 
     enqueue(eventText, {
-      sessionKey: deliveryKey,
-      contextKey: `nexus:${sessionId}`,
+      sessionKey: firstDeliveryKey,
+      contextKey,
     });
 
+    const totalCount = Array.from(filtered.values()).reduce((sum, msgs) => sum + msgs.length, 0);
     api.logger.info(
-      `[nexus-messaging] Enqueued ${agentMessages.length} message(s) from ${label} (key: ${deliveryKey})`
+      `[nexus-messaging] Enqueued batch: ${totalCount} message(s) from ${filtered.size} session(s) (key: ${firstDeliveryKey})`
     );
 
-    // Wake the agent once so it processes the batch immediately
     if (typeof wake === "function") {
       try {
-        wake({ sessionKey: deliveryKey });
+        wake({ sessionKey: firstDeliveryKey });
       } catch {
         // best-effort — agent will pick up on next heartbeat
       }
@@ -176,14 +202,16 @@ export default function register(api: any): void {
     sessions: allSessions.map((s: { id: string }) => s.id),
     pollIntervalMs: config.pollIntervalMs,
     autoRejoin: config.autoRejoin,
-    onMessage: (sessionId: string, messages) => {
-      const agentMsgs = messages.filter((m) => m.agentId !== "system");
-      const systemMsgs = messages.length - agentMsgs.length;
-      api.logger.info(
-        `[nexus-messaging] ${messages.length} message(s) from session ${sessionId}` +
-          (systemMsgs > 0 ? ` (${systemMsgs} system, skipped)` : "")
-      );
-      deliverToAgent(sessionId, messages);
+    onMessage: (batch) => {
+      for (const [sessionId, messages] of batch) {
+        const agentMsgs = messages.filter((m) => m.agentId !== "system");
+        const systemMsgs = messages.length - agentMsgs.length;
+        api.logger.info(
+          `[nexus-messaging] ${messages.length} message(s) from session ${sessionId}` +
+            (systemMsgs > 0 ? ` (${systemMsgs} system, skipped)` : "")
+        );
+      }
+      deliverToAgent(batch);
     },
   });
 

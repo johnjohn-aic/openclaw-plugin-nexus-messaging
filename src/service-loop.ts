@@ -1,13 +1,9 @@
-import { writeFileSync, readFileSync, mkdirSync, existsSync } from "node:fs";
+import { writeFileSync, readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { tmpdir } from "node:os";
 import type { Runtime, Message } from "./runtime.js";
 import { RuntimeError } from "./runtime.js";
 
-/**
- * Health state file path — shared between the gateway process (writes)
- * and the CLI process (reads). Uses /tmp so it works in containers.
- */
 const HEALTH_FILE = resolve(tmpdir(), "nexus-messaging-health.json");
 
 function persistHealth(health: ServiceHealth): void {
@@ -18,10 +14,6 @@ function persistHealth(health: ServiceHealth): void {
   }
 }
 
-/**
- * Read persisted health from disk. Used by CLI commands that run
- * in a separate process and can't access in-memory state.
- */
 export function readPersistedHealth(): ServiceHealth | null {
   try {
     if (!existsSync(HEALTH_FILE)) return null;
@@ -62,33 +54,42 @@ export interface ServiceLoopConfig {
   sessions: string[];
   pollIntervalMs: number;
   autoRejoin: boolean;
-  onMessage: (sessionId: string, messages: Message[]) => void;
+  onMessage: (batch: Map<string, Message[]>) => void;
 }
 
 export interface ServiceLoop {
   start(): void;
   stop(): Promise<void>;
   getHealth(): ServiceHealth;
-  /** Add a session to the poll loop at runtime (hot-reload). No-op if already tracked. */
   addSession(sessionId: string): void;
-  /** Remove a session from the poll loop at runtime. */
   removeSession(sessionId: string): void;
 }
 
-const MAX_BACKOFF_MS = 300_000;
+const MAX_SKIP_CYCLES = 6;
 
 interface SessionTracker {
-  timerId: ReturnType<typeof setInterval> | ReturnType<typeof setTimeout> | null;
-  timerKind: "interval" | "timeout" | null;
   cursor: string | undefined;
   consecutiveErrors: number;
   lastPollAt: string | null;
   state: SessionPollState;
+  skipUntilCycle: number;
+}
+
+function newTracker(): SessionTracker {
+  return {
+    cursor: undefined,
+    consecutiveErrors: 0,
+    lastPollAt: null,
+    state: "joining",
+    skipUntilCycle: 0,
+  };
 }
 
 export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
   let loopState: ServiceLoopState = "idle";
   const trackers = new Map<string, SessionTracker>();
+  let loopTimerId: ReturnType<typeof setInterval> | null = null;
+  let currentCycle: number = 0;
 
   function buildSessionsSnapshot(): Record<string, SessionHealth> {
     const sessions: Record<string, SessionHealth> = {};
@@ -103,104 +104,21 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
     return sessions;
   }
 
-  function clearSessionTimer(sessionId: string): void {
+  async function pollOne(sessionId: string): Promise<{ sessionId: string; messages: Message[] }> {
     const tracker = trackers.get(sessionId);
-    if (!tracker || tracker.timerId === null) return;
-    if (tracker.timerKind === "interval") {
-      clearInterval(tracker.timerId as ReturnType<typeof setInterval>);
-    } else if (tracker.timerKind === "timeout") {
-      clearTimeout(tracker.timerId as ReturnType<typeof setTimeout>);
-    }
-    tracker.timerId = null;
-    tracker.timerKind = null;
-  }
+    if (!tracker) return { sessionId, messages: [] };
 
-  function clearAllTimers(): void {
-    for (const sessionId of trackers.keys()) {
-      clearSessionTimer(sessionId);
-    }
-  }
-
-  function scheduleSteadyPoll(sessionId: string): void {
-    const tracker = trackers.get(sessionId);
-    if (!tracker) return;
-    clearSessionTimer(sessionId);
     tracker.state = "polling";
-    tracker.timerId = setInterval(
-      () => pollSession(sessionId),
-      config.pollIntervalMs
-    );
-    tracker.timerKind = "interval";
+    const result = await config.runtime.poll(sessionId, tracker.cursor);
+    tracker.lastPollAt = new Date().toISOString();
+    tracker.cursor = result.nextCursor;
+    tracker.consecutiveErrors = 0;
+    tracker.state = "polling";
+
+    return { sessionId, messages: result.messages };
   }
 
-  function applyBackoff(sessionId: string, retryFn: () => void): void {
-    const tracker = trackers.get(sessionId);
-    if (!tracker) return;
-    clearSessionTimer(sessionId);
-    tracker.state = "backoff";
-    const delay = Math.min(
-      config.pollIntervalMs * Math.pow(2, tracker.consecutiveErrors),
-      MAX_BACKOFF_MS
-    );
-    tracker.timerId = setTimeout(retryFn, delay);
-    tracker.timerKind = "timeout";
-  }
-
-  function joinAndStartPolling(sessionId: string): void {
-    const tracker = trackers.get(sessionId);
-    if (!tracker) return;
-    tracker.state = "joining";
-    config.runtime
-      .join(sessionId)
-      .then(() => {
-        if (loopState !== "running") return;
-        scheduleSteadyPoll(sessionId);
-      })
-      .catch((err: unknown) => {
-        if (loopState !== "running") return;
-        console.error(
-          `[nexus-messaging] Failed to join session ${sessionId}:`,
-          err
-        );
-        tracker.consecutiveErrors++;
-        applyBackoff(sessionId, () => joinAndStartPolling(sessionId));
-      });
-  }
-
-  function pollSession(sessionId: string): void {
-    const tracker = trackers.get(sessionId);
-    if (!tracker) return;
-    const cursor = tracker.cursor;
-    config.runtime
-      .poll(sessionId, cursor)
-      .then((result) => {
-        if (loopState !== "running") return;
-        tracker.lastPollAt = new Date().toISOString();
-        tracker.cursor = result.nextCursor;
-        // Persist health to disk so CLI process can read it
-        persistHealth({ state: loopState, sessions: buildSessionsSnapshot() });
-        if (result.messages.length > 0) {
-          try {
-            config.onMessage(sessionId, result.messages);
-          } catch (cbErr: unknown) {
-            console.error(
-              `[nexus-messaging] onMessage callback error for session ${sessionId}:`,
-              cbErr
-            );
-          }
-        }
-        if (tracker.consecutiveErrors > 0) {
-          tracker.consecutiveErrors = 0;
-          scheduleSteadyPoll(sessionId);
-        }
-      })
-      .catch((err: unknown) => {
-        if (loopState !== "running") return;
-        handlePollError(sessionId, err);
-      });
-  }
-
-  function handlePollError(sessionId: string, err: unknown): void {
+  async function handlePollError(sessionId: string, err: unknown): Promise<void> {
     const tracker = trackers.get(sessionId);
     if (!tracker) return;
     tracker.consecutiveErrors++;
@@ -214,83 +132,135 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
       console.error(
         `[nexus-messaging] Session ${sessionId} error (${err.code}), attempting auto-rejoin`
       );
-      tracker.state = "joining";
-      config.runtime
-        .join(sessionId)
-        .then(() => {
-          if (loopState !== "running") return;
-          tracker.cursor = undefined;
-          tracker.consecutiveErrors = 0;
-          scheduleSteadyPoll(sessionId);
-        })
-        .catch((rejoinErr: unknown) => {
-          if (loopState !== "running") return;
-          console.error(
-            `[nexus-messaging] Auto-rejoin failed for session ${sessionId}:`,
-            rejoinErr
-          );
-          tracker.consecutiveErrors++;
-          applyBackoff(sessionId, () => joinAndStartPolling(sessionId));
-        });
+      try {
+        await config.runtime.join(sessionId);
+        tracker.cursor = undefined;
+        tracker.consecutiveErrors = 0;
+        tracker.state = "polling";
+        return;
+      } catch (rejoinErr: unknown) {
+        console.error(
+          `[nexus-messaging] Auto-rejoin failed for session ${sessionId}:`,
+          rejoinErr
+        );
+        tracker.consecutiveErrors++;
+      }
+    } else {
+      console.error(
+        `[nexus-messaging] Poll error for session ${sessionId}:`,
+        err
+      );
+    }
+
+    const skipCycles = Math.min(Math.pow(2, tracker.consecutiveErrors), MAX_SKIP_CYCLES);
+    tracker.skipUntilCycle = currentCycle + skipCycles;
+    tracker.state = "backoff";
+  }
+
+  async function tick(): Promise<void> {
+    if (loopState !== "running") return;
+
+    const cycle = currentCycle++;
+
+    const eligible: string[] = [];
+    for (const [sessionId, tracker] of trackers) {
+      if (tracker.skipUntilCycle <= cycle && tracker.state !== "stopped") {
+        eligible.push(sessionId);
+      }
+    }
+
+    if (eligible.length === 0) {
+      persistHealth({ state: loopState, sessions: buildSessionsSnapshot() });
       return;
     }
 
-    console.error(
-      `[nexus-messaging] Poll error for session ${sessionId}:`,
-      err
+    const results = await Promise.allSettled(
+      eligible.map((sid) => pollOne(sid))
     );
-    applyBackoff(sessionId, () => pollSession(sessionId));
+
+    const batch = new Map<string, Message[]>();
+
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
+      const sessionId = eligible[i];
+
+      if (result.status === "fulfilled") {
+        if (result.value.messages.length > 0) {
+          batch.set(sessionId, result.value.messages);
+        }
+      } else {
+        await handlePollError(sessionId, result.reason);
+      }
+    }
+
+    if (batch.size > 0) {
+      try {
+        config.onMessage(batch);
+      } catch (cbErr: unknown) {
+        console.error(
+          `[nexus-messaging] onMessage callback error:`,
+          cbErr
+        );
+      }
+    }
+
+    persistHealth({ state: loopState, sessions: buildSessionsSnapshot() });
   }
 
   return {
     start(): void {
       if (loopState !== "idle" && loopState !== "stopped") return;
       loopState = "starting";
+
       for (const sessionId of config.sessions) {
-        const tracker: SessionTracker = {
-          timerId: null,
-          timerKind: null,
-          cursor: undefined,
-          consecutiveErrors: 0,
-          lastPollAt: null,
-          state: "joining",
-        };
-        trackers.set(sessionId, tracker);
-        joinAndStartPolling(sessionId);
+        trackers.set(sessionId, newTracker());
       }
-      loopState = "running";
-      persistHealth({ state: loopState, sessions: buildSessionsSnapshot() });
+
+      Promise.allSettled(
+        config.sessions.map((sid) => config.runtime.join(sid).catch(() => {}))
+      ).then(() => {
+        loopState = "running";
+        tick();
+        loopTimerId = setInterval(() => { tick(); }, config.pollIntervalMs);
+        persistHealth({ state: loopState, sessions: buildSessionsSnapshot() });
+      });
     },
 
     async stop(): Promise<void> {
       if (loopState !== "running") return;
       loopState = "stopping";
-      clearAllTimers();
+
+      if (loopTimerId !== null) {
+        clearInterval(loopTimerId);
+        loopTimerId = null;
+      }
+
       for (const tracker of trackers.values()) {
         tracker.state = "stopped";
       }
+
       loopState = "stopped";
       persistHealth({ state: loopState, sessions: buildSessionsSnapshot() });
     },
 
     addSession(sessionId: string): void {
       if (trackers.has(sessionId)) return;
-      const tracker: SessionTracker = {
-        timerId: null,
-        timerKind: null,
-        cursor: undefined,
-        consecutiveErrors: 0,
-        lastPollAt: null,
-        state: "joining",
-      };
+      const tracker = newTracker();
       trackers.set(sessionId, tracker);
+
       if (loopState === "running") {
-        joinAndStartPolling(sessionId);
+        tracker.state = "joining";
+        config.runtime.join(sessionId).catch(() => {
+          tracker.consecutiveErrors++;
+          tracker.skipUntilCycle = currentCycle + 2;
+          tracker.state = "backoff";
+        });
       }
+
+      persistHealth({ state: loopState, sessions: buildSessionsSnapshot() });
     },
 
     removeSession(sessionId: string): void {
-      clearSessionTimer(sessionId);
       trackers.delete(sessionId);
       persistHealth({ state: loopState, sessions: buildSessionsSnapshot() });
     },
