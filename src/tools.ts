@@ -127,6 +127,10 @@ export function registerTools(
           const result = await runtime.join(params.sessionId);
           // Hot-reload: add to poll loop immediately
           serviceLoop.addSession(params.sessionId);
+          // Store label if provided
+          if (params.label && sessionLabels) {
+            sessionLabels.set(params.sessionId, params.label);
+          }
           return mcpOk({ ...result, polling: true, label: params.label ?? null });
         } catch (err: unknown) {
           return mcpError(err);
@@ -200,7 +204,7 @@ export function registerTools(
           const sessions = Object.entries(health.sessions).map(
             ([sessionId, sh]) => ({
               sessionId,
-              label: sessionLabels.get(sessionId) ?? null,
+              label: sessionLabels?.get(sessionId) ?? null,
               state: sh.state,
               lastPollAt: sh.lastPollAt,
               cursor: sh.cursor,
