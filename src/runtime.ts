@@ -107,6 +107,7 @@ function classifyError(
   if (
     lower.includes("expired") ||
     lower.includes("not found") ||
+    lower.includes("not_found") ||
     lower.includes("404")
   ) {
     return new RuntimeError("session-expired", combined, {
