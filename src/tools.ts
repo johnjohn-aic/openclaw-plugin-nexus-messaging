@@ -148,13 +148,15 @@ export function registerTools(
         required: ["sessionId"],
       },
       async execute(_id: string, params: { sessionId: string }) {
+        // Always remove from poll loop, even if server leave fails
+        // (session may already be expired on server)
+        serviceLoop.removeSession(params.sessionId);
         try {
           const result = await runtime.leave(params.sessionId);
-          // Remove from poll loop
-          serviceLoop.removeSession(params.sessionId);
           return mcpOk({ ...result, polling: false });
         } catch (err: unknown) {
-          return mcpError(err);
+          // Still stopped polling even if server returned an error
+          return mcpOk({ sessionId: params.sessionId, polling: false, serverLeave: "failed (session may be expired)" });
         }
       },
     },

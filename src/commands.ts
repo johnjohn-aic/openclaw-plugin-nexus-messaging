@@ -98,14 +98,14 @@ async function handleLeave(
   if (!sessionId) {
     return { text: "Usage: /nexus leave <sessionId>" };
   }
+  // Always remove from poll loop first, even if server leave fails
+  // (session may already be expired on server)
+  serviceLoop.removeSession(sessionId);
   try {
     const result = await runtime.leave(sessionId);
-    if (result.ok) {
-      serviceLoop.removeSession(sessionId);
-    }
-    return { text: result.ok ? `Left session ${sessionId}` : `Failed to leave session ${sessionId}` };
+    return { text: result.ok ? `Left session ${sessionId}` : `Left session ${sessionId} (poll stopped, server leave failed)` };
   } catch (err: unknown) {
-    return { text: formatError(err) };
+    return { text: `Left session ${sessionId} (poll stopped, server: ${formatError(err)})` };
   }
 }
 
