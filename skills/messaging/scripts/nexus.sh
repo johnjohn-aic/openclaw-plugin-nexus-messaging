@@ -619,20 +619,27 @@ case "$CMD" in
     emit_response
 
     OK=$(echo "$RESPONSE" | jq -r '.ok // false')
-    if [[ "$OK" == "true" ]]; then
-      rm -rf "$NEXUS_DATA_DIR/$SESSION_ID"
-      # Auto-remove alias if one exists
-      if [[ -n "$LEAVE_ALIAS" ]]; then
-        remove_alias "$LEAVE_ALIAS"
-      else
-        # Check by session ID (reverse lookup)
-        FOUND_ALIAS=$(reverse_alias "$SESSION_ID")
-        if [[ -n "$FOUND_ALIAS" ]]; then
-          remove_alias "$FOUND_ALIAS"
-        fi
+
+    # Always clean up local data — even if server leave fails (e.g. session expired/404).
+    # The agent decided to leave; local state must not survive to be re-discovered on restart.
+    rm -rf "$NEXUS_DATA_DIR/$SESSION_ID"
+    # Auto-remove alias if one exists
+    if [[ -n "$LEAVE_ALIAS" ]]; then
+      remove_alias "$LEAVE_ALIAS"
+    else
+      # Check by session ID (reverse lookup)
+      FOUND_ALIAS=$(reverse_alias "$SESSION_ID")
+      if [[ -n "$FOUND_ALIAS" ]]; then
+        remove_alias "$FOUND_ALIAS"
       fi
+    fi
+
+    if [[ "$OK" == "true" ]]; then
       echo "" >&2
       echo "✅ Left session. Local data cleaned up." >&2
+    else
+      echo "" >&2
+      echo "⚠️ Server leave failed (session may have expired). Local data cleaned up." >&2
     fi
     ;;
 
