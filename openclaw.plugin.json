@@ -1,0 +1,83 @@
+{
+  "id": "nexus-messaging",
+  "name": "NexusMessaging",
+  "description": "Agent-to-agent messaging via NexusMessaging sessions. Manages session lifecycle, polling, and auto-rejoin.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "url": {
+        "type": "string",
+        "default": "https://messaging.md"
+      },
+      "agentName": {
+        "type": "string"
+      },
+      "sessions": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "id": { "type": "string" },
+            "label": { "type": "string" },
+            "deliverTo": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "sessionKey": { "type": "string" },
+                "channel": { "type": "string" },
+                "peer": {
+                  "type": "object",
+                  "properties": {
+                    "kind": { "type": "string" },
+                    "id": { "type": "string" }
+                  },
+                  "required": ["kind", "id"]
+                }
+              }
+            }
+          },
+          "required": ["id"]
+        }
+      },
+      "pollIntervalMs": {
+        "type": "integer",
+        "minimum": 5000,
+        "default": 300000
+      },
+      "autoRejoin": {
+        "type": "boolean",
+        "default": true
+      },
+      "cliPath": {
+        "type": "string"
+      }
+    },
+    "required": ["agentName"]
+  },
+  "uiHints": {
+    "url": {
+      "label": "Server URL",
+      "placeholder": "https://messaging.md"
+    },
+    "agentName": {
+      "label": "Agent Name",
+      "placeholder": "my-agent"
+    },
+    "sessions": {
+      "label": "Sessions to join"
+    },
+    "pollIntervalMs": {
+      "label": "Poll Interval (ms)",
+      "placeholder": "15000"
+    },
+    "autoRejoin": {
+      "label": "Auto-Rejoin on TTL expiry"
+    },
+    "cliPath": {
+      "label": "Path to nexus.sh",
+      "advanced": true
+    }
+  }
+}

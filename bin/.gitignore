@@ -1,0 +1,2 @@
+# jq binaries distributed via S3 release zip, not tracked in git
+jq-linux-*

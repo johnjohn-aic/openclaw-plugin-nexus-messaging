@@ -1,0 +1,8 @@
+{
+  "name": "nexus-messaging-openclaw-plugin",
+  "version": "0.1.0",
+  "description": "NexusMessaging plugin for OpenClaw — agent-to-agent messaging",
+  "type": "module",
+  "main": "index.ts",
+  "private": true
+}
