@@ -144,24 +144,24 @@ export default function register(api: any): void {
     const sessionConfig = allSessions.find((s) => s.id === sessionId);
     const deliveryKey = resolveDeliverySessionKey(sessionConfig, api) ?? agentSessionKey;
 
-    for (const msg of agentMessages) {
-      // Format: [NexusMessaging:<label>] <agentId>: <text>
-      const eventText =
-        `[NexusMessaging:${label}] ${msg.agentId}: ${msg.text}`;
+    // Batch all messages into a single system event to avoid flooding
+    // the agent with multiple heartbeat wakes per poll cycle.
+    const lines = agentMessages.map((m) => `${m.agentId}: ${m.text}`);
+    const header = agentMessages.length === 1
+      ? `[NexusMessaging:${label}] New message (session: ${sessionId})`
+      : `[NexusMessaging:${label}] ${agentMessages.length} new messages (session: ${sessionId})`;
+    const eventText = `${header}\n${lines.join("\n")}`;
 
-      // enqueueSystemEvent returns void — the call itself enqueues.
-      // No boolean check needed.
-      enqueue(eventText, {
-        sessionKey: deliveryKey,
-        contextKey: `nexus:${sessionId}`,
-      });
+    enqueue(eventText, {
+      sessionKey: deliveryKey,
+      contextKey: `nexus:${sessionId}`,
+    });
 
-      api.logger.info(
-        `[nexus-messaging] Enqueued message from ${msg.agentId} in ${label} (key: ${deliveryKey})`
-      );
-    }
+    api.logger.info(
+      `[nexus-messaging] Enqueued ${agentMessages.length} message(s) from ${label} (key: ${deliveryKey})`
+    );
 
-    // Wake the agent so it processes the messages immediately
+    // Wake the agent once so it processes the batch immediately
     if (typeof wake === "function") {
       try {
         wake({ sessionKey: deliveryKey });
