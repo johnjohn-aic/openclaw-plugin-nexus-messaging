@@ -73,6 +73,7 @@ async function handleSend(
 
 async function handleJoin(
   runtime: Runtime,
+  serviceLoop: ServiceLoop,
   args: string,
 ): Promise<{ text: string }> {
   const sessionId = args.trim();
@@ -81,6 +82,7 @@ async function handleJoin(
   }
   try {
     const result = await runtime.join(sessionId);
+    serviceLoop.addSession(result.sessionId);
     return { text: `Joined session ${result.sessionId} (key: ${result.sessionKey})` };
   } catch (err: unknown) {
     return { text: formatError(err) };
@@ -89,6 +91,7 @@ async function handleJoin(
 
 async function handleLeave(
   runtime: Runtime,
+  serviceLoop: ServiceLoop,
   args: string,
 ): Promise<{ text: string }> {
   const sessionId = args.trim();
@@ -97,6 +100,9 @@ async function handleLeave(
   }
   try {
     const result = await runtime.leave(sessionId);
+    if (result.ok) {
+      serviceLoop.removeSession(sessionId);
+    }
     return { text: result.ok ? `Left session ${sessionId}` : `Failed to leave session ${sessionId}` };
   } catch (err: unknown) {
     return { text: formatError(err) };
@@ -125,9 +131,9 @@ export function registerSlashCommands(
         case "send":
           return handleSend(runtime, rest);
         case "join":
-          return handleJoin(runtime, rest);
+          return handleJoin(runtime, serviceLoop, rest);
         case "leave":
-          return handleLeave(runtime, rest);
+          return handleLeave(runtime, serviceLoop, rest);
         default:
           return { text: USAGE };
       }
