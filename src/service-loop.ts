@@ -217,8 +217,18 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
       }
 
       Promise.allSettled(
-        config.sessions.map((sid) => config.runtime.join(sid).catch(() => {}))
-      ).then(() => {
+        config.sessions.map((sid) => config.runtime.join(sid))
+      ).then((results) => {
+        for (let i = 0; i < results.length; i++) {
+          if (results[i].status === "rejected") {
+            const tracker = trackers.get(config.sessions[i]);
+            if (tracker) {
+              tracker.consecutiveErrors = 1;
+              tracker.state = "backoff";
+              tracker.skipUntilCycle = currentCycle + 2;
+            }
+          }
+        }
         loopState = "running";
         tick();
         loopTimerId = setInterval(() => { tick(); }, config.pollIntervalMs);
