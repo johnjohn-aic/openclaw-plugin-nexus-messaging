@@ -110,7 +110,7 @@ Required config patch (adapt values):
         enabled: true,
         config: {
           agentName: "<AGENT_NAME>",
-          pollIntervalMs: 15000,
+          pollIntervalMs: 300000,
           autoRejoin: true,
           sessions: []  // add sessions later or via nexus_join tool
         }
