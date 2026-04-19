@@ -38,6 +38,8 @@ export interface NexusMessagingConfig {
   autoRejoin: boolean;
   /** Path to nexus.sh CLI (auto-detected if omitted) */
   cliPath: string;
+  /** Timeout for CLI commands in milliseconds */
+  timeoutMs: number;
 }
 
 /**
@@ -107,6 +109,9 @@ export function parseConfig(raw: unknown): NexusMessagingConfig {
     typeof cfg.cliPath === "string" ? cfg.cliPath : undefined
   );
 
+  // timeoutMs with default
+  const timeoutMs = typeof cfg.timeoutMs === "number" ? Math.max(5000, cfg.timeoutMs) : 30000;
+
   return {
     url,
     agentName: agentName.trim(),
@@ -114,6 +119,7 @@ export function parseConfig(raw: unknown): NexusMessagingConfig {
     pollIntervalMs,
     autoRejoin,
     cliPath,
+    timeoutMs,
   };
 }
 

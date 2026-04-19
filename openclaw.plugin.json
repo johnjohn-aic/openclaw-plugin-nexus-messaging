@@ -52,6 +52,12 @@
       },
       "cliPath": {
         "type": "string"
+      },
+      "timeoutMs": {
+        "type": "integer",
+        "minimum": 5000,
+        "default": 30000,
+        "description": "Timeout for CLI commands in milliseconds"
       }
     },
     "required": ["agentName"]
@@ -70,13 +76,18 @@
     },
     "pollIntervalMs": {
       "label": "Poll Interval (ms)",
-      "placeholder": "15000"
+      "placeholder": "300000"
     },
     "autoRejoin": {
       "label": "Auto-Rejoin on TTL expiry"
     },
     "cliPath": {
       "label": "Path to nexus.sh",
+      "advanced": true
+    },
+    "timeoutMs": {
+      "label": "CLI Timeout (ms)",
+      "placeholder": "30000",
       "advanced": true
     }
   }

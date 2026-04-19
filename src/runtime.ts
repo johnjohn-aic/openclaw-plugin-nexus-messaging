@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { promisify } from "node:util";
-import { arch, tmpdir } from "node:os";
+import { arch, homedir, tmpdir } from "node:os";
 import type { NexusMessagingConfig } from "./config.js";
 
 const execFileAsync = promisify(execFile);
@@ -144,8 +144,8 @@ function classifyError(
  * skipped.
  */
 function ensureLocalSessionState(sessionId: string, agentName: string): void {
-  const homedir = require("node:os").homedir();
-  const sessionDir = resolve(homedir, ".config", "messaging", "sessions", sessionId);
+  const home = homedir();
+  const sessionDir = resolve(home, ".config", "messaging", "sessions", sessionId);
   const agentFile = resolve(sessionDir, "agent");
 
   try {
@@ -163,10 +163,7 @@ export function createRuntime(config: NexusMessagingConfig): Runtime {
     );
   }
 
-  const timeoutMs: number =
-    typeof (config as unknown as Record<string, unknown>).timeoutMs === "number"
-      ? ((config as unknown as Record<string, unknown>).timeoutMs as number)
-      : DEFAULT_TIMEOUT_MS;
+  const timeoutMs: number = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   // Resolve bundled jq binary based on architecture.
   // The plugin ships jq-linux-x64 and jq-linux-arm64 in bin/.

@@ -155,6 +155,7 @@ export function registerTools(
         // Always remove from poll loop, even if server leave fails
         // (session may already be expired on server)
         serviceLoop.removeSession(params.sessionId);
+        sessionLabels?.delete(params.sessionId);
         try {
           const result = await runtime.leave(params.sessionId);
           return mcpOk({ ...result, polling: false });
