@@ -6,31 +6,45 @@ import type { NexusMessagingConfig } from "./config.js";
 import { resolveAlias, reverseAliasLookup, writeAlias, removeAlias } from "./aliases.js";
 
 const USAGE = [
-  "Usage: /nexus <subcommand>",
+  "Usage: /nexus <command>",
   "",
-  "Subcommands:",
-  "  status                        Show service loop health",
-  "  send <sessionId> <text>       Send a message to a session",
-  "  join <sessionId>              Join a session",
-  "  leave <sessionId>             Leave a session",
-  "  poll [sessionId]              Force-poll sessions for new messages",
-  "  history <sessionId> [limit]   Query past messages without affecting poll cursor",
+  "Commands:",
+  "  status                              Show active sessions and their state",
+  "  send <session|alias> <text>         Send a message to a session",
+  "  join <sessionId> [alias]            Join a session (alias lets you use a name instead of UUID)",
+  "  leave <session|alias>               Leave a session and stop receiving messages",
+  "  poll [session|alias]                Check for new messages now (all sessions if omitted)",
+  "  history <session|alias> [limit]     Show recent messages (default: last 20)",
+  "",
+  "Tip: Use an alias (e.g. \"team-chat\") anywhere a session ID is expected.",
 ].join("\n");
 
 function formatHealth(health: ServiceHealth): string {
-  const lines: string[] = [`State: ${health.state}`];
-
   const sessionIds = Object.keys(health.sessions);
-  lines.push(`Sessions: ${sessionIds.length}`);
 
+  const stateEmoji = health.state === "running" ? "🟢" : health.state === "stopped" ? "🔴" : "🟡";
+  const lines: string[] = [`${stateEmoji} Service: ${health.state} | ${sessionIds.length} session(s)`];
+
+  if (sessionIds.length === 0) {
+    lines.push("  No sessions. Use /nexus join <id> [alias] to add one.");
+    return lines.join("\n");
+  }
+
+  lines.push("");
   for (const id of sessionIds) {
     const s = health.sessions[id];
     const alias = reverseAliasLookup(id);
-    const parts = [`state=${s.state}`];
-    if (s.lastPollAt) parts.push(`lastPoll=${s.lastPollAt}`);
-    if (s.consecutiveErrors > 0) parts.push(`errors=${s.consecutiveErrors}`);
-    const display = alias ? `${id} (${alias})` : id;
-    lines.push(`  ${display}: ${parts.join(", ")}`);
+    const name = alias ?? id.slice(0, 8) + "…";
+    const stateIcon = s.state === "polling" ? "✅" : s.state === "backoff" ? "⚠️" : s.state === "joining" ? "⏳" : "⏹️";
+    const parts: string[] = [];
+    if (s.lastPollAt) {
+      const ago = Math.round((Date.now() - new Date(s.lastPollAt).getTime()) / 1000);
+      parts.push(ago < 60 ? `${ago}s ago` : `${Math.round(ago / 60)}m ago`);
+    }
+    if (s.consecutiveErrors > 0) parts.push(`${s.consecutiveErrors} error(s)`);
+    const detail = parts.length > 0 ? ` — ${parts.join(", ")}` : "";
+    const fullId = alias ? ` (${id})` : "";
+    lines.push(`  ${stateIcon} ${name}${fullId}${detail}`);
   }
 
   return lines.join("\n");
@@ -57,23 +71,24 @@ async function handleSend(
   const trimmed = args.trim();
   const spaceIdx = trimmed.indexOf(" ");
   if (spaceIdx === -1) {
-    return { text: "Usage: /nexus send <sessionId> <text>" };
+    return { text: "Usage: /nexus send <session|alias> <text>\nExample: /nexus send team-chat Hello everyone!" };
   }
   const rawId = trimmed.slice(0, spaceIdx);
   const text = trimmed.slice(spaceIdx + 1);
   if (!rawId || !text) {
-    return { text: "Usage: /nexus send <sessionId> <text>" };
+    return { text: "Usage: /nexus send <session|alias> <text>\nExample: /nexus send team-chat Hello everyone!" };
   }
   const sessionId = resolveAlias(rawId);
+  const display = rawId !== sessionId ? `${rawId} (${sessionId})` : sessionId;
   try {
     const result = await runtime.send(sessionId, text);
     return {
       text: result.ok
-        ? `Message sent to ${sessionId}`
-        : `Failed to send message to ${sessionId}`,
+        ? `✅ Message sent to ${display}`
+        : `❌ Failed to send message to ${display}`,
     };
   } catch (err: unknown) {
-    return { text: formatError(err) };
+    return { text: `❌ ${formatError(err)}` };
   }
 }
 
@@ -85,7 +100,7 @@ async function handleJoin(
   const parts = args.trim().split(/\s+/);
   const rawId = parts[0];
   if (!rawId) {
-    return { text: "Usage: /nexus join <sessionId> [label]" };
+    return { text: "Usage: /nexus join <sessionId> [alias]\nExample: /nexus join abc123-def456 team-chat\n\nThe alias lets you use a short name instead of the UUID in all commands." };
   }
   const sessionId = resolveAlias(rawId);
   const label = parts[1];
@@ -96,9 +111,10 @@ async function handleJoin(
       writeAlias(result.sessionId, label);
     }
     const display = label ? `${result.sessionId} (alias: ${label})` : result.sessionId;
-    return { text: `Joined session ${display} (key: ${result.sessionKey})` };
+    const tip = label ? "" : "\nTip: Add an alias next time — /nexus join <id> my-alias";
+    return { text: `✅ Joined session ${display}${tip}` };
   } catch (err: unknown) {
-    return { text: formatError(err) };
+    return { text: `❌ ${formatError(err)}` };
   }
 }
 
@@ -109,16 +125,17 @@ async function handleLeave(
 ): Promise<{ text: string }> {
   const rawId = args.trim();
   if (!rawId) {
-    return { text: "Usage: /nexus leave <sessionId>" };
+    return { text: "Usage: /nexus leave <session|alias>\nExample: /nexus leave team-chat" };
   }
   const sessionId = resolveAlias(rawId);
+  const display = rawId !== sessionId ? `${rawId} (${sessionId})` : sessionId;
   serviceLoop.removeSession(sessionId);
   removeAlias(sessionId);
   try {
     const result = await runtime.leave(sessionId);
-    return { text: result.ok ? `Left session ${sessionId}` : `Left session ${sessionId} (poll stopped, server leave failed)` };
+    return { text: result.ok ? `✅ Left session ${display}` : `⚠️ Left session ${display} (stopped polling, but server leave failed)` };
   } catch (err: unknown) {
-    return { text: `Left session ${sessionId} (poll stopped, server: ${formatError(err)})` };
+    return { text: `⚠️ Left session ${display} (stopped polling, server: ${formatError(err)})` };
   }
 }
 
@@ -130,12 +147,15 @@ async function handlePoll(
   const sessionId = raw ? resolveAlias(raw) : undefined;
   try {
     const result = await serviceLoop.forcePoll(sessionId);
-    const target = sessionId ? `session ${sessionId}` : "all sessions";
+    const target = sessionId ? `session ${raw}` : "all sessions";
+    if (result.messagesReceived === 0) {
+      return { text: `📭 No new messages in ${target}` };
+    }
     return {
-      text: `Polled ${target}: ${result.polled.length} session(s) responded, ${result.messagesReceived} message(s) received`,
+      text: `📬 ${result.messagesReceived} new message(s) from ${result.polled.length} session(s)`,
     };
   } catch (err: unknown) {
-    return { text: formatError(err) };
+    return { text: `❌ ${formatError(err)}` };
   }
 }
 
@@ -146,25 +166,26 @@ async function handleHistory(
   const parts = args.trim().split(/\s+/);
   const rawId = parts[0];
   if (!rawId) {
-    return { text: "Usage: /nexus history <sessionId> [limit]" };
+    return { text: "Usage: /nexus history <session|alias> [limit]\nExample: /nexus history team-chat 10\n\nShows the most recent messages (default: 20)." };
   }
   const sessionId = resolveAlias(rawId);
   // NOTE: Fetches all messages from cursor "0" and slices client-side.
   const limit = parts[1] ? parseInt(parts[1], 10) : 20;
   if (isNaN(limit) || limit <= 0) {
-    return { text: "Usage: /nexus history <sessionId> [limit]" };
+    return { text: "Usage: /nexus history <session|alias> [limit]\nLimit must be a positive number. Example: /nexus history team-chat 10" };
   }
+  const display = rawId !== sessionId ? `${rawId} (${sessionId})` : sessionId;
   try {
     const result = await runtime.poll(sessionId, "0");
     const messages = result.messages.slice(-limit);
     if (messages.length === 0) {
-      return { text: `History for ${sessionId}: no messages found` };
+      return { text: `📭 No messages in ${display}` };
     }
     const lines = messages.map((m) => `[${m.timestamp}] ${m.agentId}: ${m.text}`);
-    const header = `History for ${sessionId}: ${messages.length} message(s)`;
+    const header = `📜 ${display} — last ${messages.length} message(s):`;
     return { text: `${header}\n${lines.join("\n")}` };
   } catch (err: unknown) {
-    return { text: formatError(err) };
+    return { text: `❌ ${formatError(err)}` };
   }
 }
 
@@ -175,7 +196,7 @@ export function registerSlashCommands(
 ): void {
   api.registerCommand({
     name: "nexus",
-    description: "NexusMessaging commands: status, send, join, leave, poll, history",
+    description: "NexusMessaging — manage agent-to-agent messaging sessions",
     acceptsArgs: true,
     requireAuth: true,
     handler: async (ctx: { args?: string }) => {
