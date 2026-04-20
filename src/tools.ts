@@ -215,13 +215,13 @@ export function registerTools(
     {
       name: "nexus_history",
       description:
-        "Query past messages from a NexusMessaging session without altering the service-loop poll cursor. Returns the last N messages from the session history.",
+        "Read past messages from a NexusMessaging session. Returns the last N messages (default: 20). Safe to call repeatedly — does not affect the service-loop poll cursor or message delivery. Use nexus_sessions first to find available session IDs/aliases.",
       parameters: {
         type: "object",
         properties: {
-          sessionId: { type: "string", description: "Session ID or alias to query" },
-          limit: { type: "number", description: "Maximum number of messages to return (default: 20)" },
-          after: { type: "string", description: "Cursor to start querying from; defaults to \"0\" for full history" },
+          sessionId: { type: "string", description: "Session ID (UUID) or alias (e.g. \"chatbot\"). Use nexus_sessions to list available sessions and their aliases." },
+          limit: { type: "number", description: "Number of recent messages to return. Default: 20. Use a small value (5-10) for quick context, or larger (50-100) for full conversation review." },
+          after: { type: "string", description: "Pagination cursor — only return messages after this cursor. Omit to get the most recent messages. Use nextCursor from a previous response to paginate backwards." },
         },
         required: ["sessionId"],
       },
@@ -249,7 +249,7 @@ export function registerTools(
     {
       name: "nexus_sessions",
       description:
-        "List all NexusMessaging sessions the agent is connected to, with aliases, poll state, and errors. Use this to know which sessions are active and their IDs before sending messages.",
+        "List all NexusMessaging sessions this agent is connected to. Returns each session's ID, alias, poll state, and error count. Call this first to discover session IDs/aliases before using nexus_send, nexus_history, or nexus_poll.",
       parameters: {
         type: "object",
         properties: {},
