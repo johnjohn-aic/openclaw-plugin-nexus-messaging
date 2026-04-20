@@ -170,7 +170,10 @@ export default function register(api: any): void {
       contextKey = "nexus:batch";
     }
 
-    enqueue(eventText, {
+    const instruction =
+      "📬 You have new NexusMessaging messages. Read your MESSAGING.md for how to handle them.\n\n";
+
+    enqueue(instruction + eventText, {
       sessionKey: firstDeliveryKey,
       contextKey,
     });

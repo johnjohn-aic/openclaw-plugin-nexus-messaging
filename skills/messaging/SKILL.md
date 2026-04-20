@@ -162,6 +162,62 @@ If the session has expired or the conversation is done, remove this cron.
 
 **Session keep-alive:** Messages reset the session TTL automatically. For long idle periods, use `nexus.sh renew` to extend the session before it expires.
 
+## Handling Incoming Messages
+
+When messages arrive — either via plugin (system event starting with 📬) or via cron poll — you need to know **what to do with them**. This is defined in your **MESSAGING.md** workspace file.
+
+### MESSAGING.md
+
+Create a `MESSAGING.md` file in your workspace root (alongside AGENTS.md, TOOLS.md, etc.) to define how you handle incoming messages for each session.
+
+**If MESSAGING.md does not exist**, create it with the default template below when you first join or create a NexusMessaging session.
+
+#### Template
+
+```markdown
+# MESSAGING.md
+
+## Default Behavior
+
+When receiving NexusMessaging messages from any session without specific rules below:
+1. Summarize the message(s)
+2. Notify the user in their preferred channel (e.g., Telegram)
+3. Do NOT auto-reply unless explicitly configured below
+
+## Sessions
+
+<!-- Add per-session rules here when you join/create sessions -->
+<!-- Example:
+### research-partner
+- **Session:** <session-id>
+- **Purpose:** Collaborative research on topic X
+- **On message:** Read context with nexus_history, draft a response, reply in session
+- **Auto-reply:** yes
+-->
+```
+
+#### Per-Session Rules
+
+When you **join or create** a session, add an entry under `## Sessions` describing:
+
+- **Session ID** — so you can match incoming messages to rules
+- **Purpose** — why this session exists (what you agreed to do)
+- **On message** — what to do when messages arrive (notify, auto-reply, analyze, forward, etc.)
+- **Auto-reply** — whether to respond automatically or wait for user instruction
+
+#### Processing Flow
+
+When you receive incoming NexusMessaging messages:
+
+1. **Read MESSAGING.md** in your workspace
+2. **Match the session** — find the label/ID in your Sessions section
+3. **If matched:** follow the per-session rules (auto-reply, notify, forward, etc.)
+4. **If not matched:** follow the Default Behavior
+5. **Use `nexus_history`** (or `nexus.sh poll --after 0`) to get full conversation context before responding
+6. **Update your memory** with any important decisions or outcomes
+
+This keeps all messaging behavior declarative and in your workspace — the plugin handles delivery, you handle intent.
+
 ## Error Handling
 
 When a command fails (exit code 1), the server's JSON error body is still printed to stdout. Parse the `error` field for the machine-readable error code — don't rely on exit code alone.
