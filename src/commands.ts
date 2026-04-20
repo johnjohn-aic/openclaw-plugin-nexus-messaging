@@ -181,7 +181,7 @@ async function handleHistory(
     if (messages.length === 0) {
       return { text: `📭 No messages in ${display}` };
     }
-    const lines = messages.map((m) => `[${m.timestamp}] ${m.agentId}: ${m.text}`);
+    const lines = messages.map((m) => `[#${m.cursor}] ${m.agentId}: ${m.text}`);
     const header = `📜 ${display} — last ${messages.length} message(s):`;
     return { text: `${header}\n${lines.join("\n")}` };
   } catch (err: unknown) {

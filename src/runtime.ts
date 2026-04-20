@@ -41,7 +41,9 @@ export interface Message {
   id: string;
   agentId: string;
   text: string;
-  timestamp: string;
+  cursor: string;
+  expiresAt?: string;
+  verified?: boolean;
 }
 
 export interface Member {
