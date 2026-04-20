@@ -57,12 +57,18 @@ export interface ServiceLoopConfig {
   onMessage: (batch: Map<string, Message[]>) => void;
 }
 
+export interface ForcePollResult {
+  polled: string[];
+  messagesReceived: number;
+}
+
 export interface ServiceLoop {
   start(): void;
   stop(): Promise<void>;
   getHealth(): ServiceHealth;
   addSession(sessionId: string): void;
   removeSession(sessionId: string): void;
+  forcePoll(sessionId?: string): Promise<ForcePollResult>;
 }
 
 const MAX_SKIP_CYCLES = 6;
@@ -273,6 +279,65 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
     removeSession(sessionId: string): void {
       trackers.delete(sessionId);
       persistHealth({ state: loopState, sessions: buildSessionsSnapshot() });
+    },
+
+    async forcePoll(sessionId?: string): Promise<ForcePollResult> {
+      let targets: string[];
+      if (sessionId !== undefined) {
+        if (!trackers.has(sessionId)) {
+          return { polled: [], messagesReceived: 0 };
+        }
+        targets = [sessionId];
+      } else {
+        targets = [...trackers.keys()];
+      }
+
+      if (targets.length === 0) {
+        return { polled: [], messagesReceived: 0 };
+      }
+
+      for (const sid of targets) {
+        const tracker = trackers.get(sid);
+        if (tracker) {
+          tracker.skipUntilCycle = 0;
+        }
+      }
+
+      const results = await Promise.allSettled(
+        targets.map((sid) => pollOne(sid))
+      );
+
+      const batch = new Map<string, Message[]>();
+      const polled: string[] = [];
+      let messagesReceived = 0;
+
+      for (let i = 0; i < results.length; i++) {
+        const result = results[i];
+        const sid = targets[i];
+
+        if (result.status === "fulfilled") {
+          polled.push(sid);
+          if (result.value.messages.length > 0) {
+            batch.set(sid, result.value.messages);
+            messagesReceived += result.value.messages.length;
+          }
+        } else {
+          await handlePollError(sid, result.reason);
+        }
+      }
+
+      if (batch.size > 0) {
+        try {
+          config.onMessage(batch);
+        } catch (cbErr: unknown) {
+          console.error(
+            `[nexus-messaging] onMessage callback error:`,
+            cbErr
+          );
+        }
+      }
+
+      return { polled, messagesReceived };
     },
 
     getHealth(): ServiceHealth {

@@ -12,6 +12,7 @@ const USAGE = [
   "  send <sessionId> <text>   Send a message to a session",
   "  join <sessionId>          Join a session",
   "  leave <sessionId>         Leave a session",
+  "  poll [sessionId]          Force-poll sessions for new messages",
 ].join("\n");
 
 function formatHealth(health: ServiceHealth): string {
@@ -98,14 +99,28 @@ async function handleLeave(
   if (!sessionId) {
     return { text: "Usage: /nexus leave <sessionId>" };
   }
-  // Always remove from poll loop first, even if server leave fails
-  // (session may already be expired on server)
   serviceLoop.removeSession(sessionId);
   try {
     const result = await runtime.leave(sessionId);
     return { text: result.ok ? `Left session ${sessionId}` : `Left session ${sessionId} (poll stopped, server leave failed)` };
   } catch (err: unknown) {
     return { text: `Left session ${sessionId} (poll stopped, server: ${formatError(err)})` };
+  }
+}
+
+async function handlePoll(
+  serviceLoop: ServiceLoop,
+  args: string,
+): Promise<{ text: string }> {
+  const sessionId = args.trim() || undefined;
+  try {
+    const result = await serviceLoop.forcePoll(sessionId);
+    const target = sessionId ? `session ${sessionId}` : "all sessions";
+    return {
+      text: `Polled ${target}: ${result.polled.length} session(s) responded, ${result.messagesReceived} message(s) received`,
+    };
+  } catch (err: unknown) {
+    return { text: formatError(err) };
   }
 }
 
@@ -116,7 +131,7 @@ export function registerSlashCommands(
 ): void {
   api.registerCommand({
     name: "nexus",
-    description: "NexusMessaging commands: status, send, join, leave",
+    description: "NexusMessaging commands: status, send, join, leave, poll",
     acceptsArgs: true,
     requireAuth: true,
     handler: async (ctx: { args?: string }) => {
@@ -134,6 +149,8 @@ export function registerSlashCommands(
           return handleJoin(runtime, serviceLoop, rest);
         case "leave":
           return handleLeave(runtime, serviceLoop, rest);
+        case "poll":
+          return handlePoll(serviceLoop, rest);
         default:
           return { text: USAGE };
       }

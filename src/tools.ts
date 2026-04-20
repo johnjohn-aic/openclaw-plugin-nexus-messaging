@@ -191,6 +191,29 @@ export function registerTools(
 
   api.registerTool(
     {
+      name: "nexus_force_poll",
+      description: "Force-poll one or all tracked NexusMessaging sessions for new messages immediately, bypassing the normal poll interval and backoff",
+      parameters: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string", description: "Optional session ID to poll; if omitted, all tracked sessions are polled" },
+        },
+        required: [],
+      },
+      async execute(_id: string, params: { sessionId?: string }) {
+        try {
+          const result = await serviceLoop.forcePoll(params.sessionId);
+          return mcpOk({ ok: true, ...result });
+        } catch (err: unknown) {
+          return mcpError(err);
+        }
+      },
+    },
+    { optional: true },
+  );
+
+  api.registerTool(
+    {
       name: "nexus_sessions",
       description:
         "List all NexusMessaging sessions the agent is connected to, with labels, poll state, and errors. Use this to know which sessions are active and their IDs before sending messages.",
