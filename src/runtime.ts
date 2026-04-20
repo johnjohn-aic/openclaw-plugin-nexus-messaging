@@ -115,7 +115,6 @@ function classifyError(
     lower.includes("expired") ||
     lower.includes("session not found") ||
     lower.includes("session_not_found") ||
-    lower.includes("not_found") ||
     (lower.includes("404") && !lower.includes("command not found"))
   ) {
     return new RuntimeError("session-expired", combined, {

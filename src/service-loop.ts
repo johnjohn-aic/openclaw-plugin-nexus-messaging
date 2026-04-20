@@ -4,25 +4,24 @@ import { tmpdir } from "node:os";
 import type { Runtime, RenewResult, Message } from "./runtime.js";
 import { RuntimeError } from "./runtime.js";
 
-let HEALTH_FILE = resolve(tmpdir(), "nexus-messaging-health.json");
-
-function setHealthFileName(agentName?: string): void {
+function buildHealthFilePath(agentName?: string): string {
   const suffix = agentName ? `-${agentName.replace(/[^a-zA-Z0-9_-]/g, "_")}` : "";
-  HEALTH_FILE = resolve(tmpdir(), `nexus-messaging-health${suffix}.json`);
+  return resolve(tmpdir(), `nexus-messaging-health${suffix}.json`);
 }
 
-function persistHealth(health: ServiceHealth): void {
+function persistHealth(healthFile: string, health: ServiceHealth): void {
   try {
-    writeFileSync(HEALTH_FILE, JSON.stringify(health), "utf-8");
+    writeFileSync(healthFile, JSON.stringify(health), "utf-8");
   } catch {
     // best-effort — /tmp should always be writable
   }
 }
 
-export function readPersistedHealth(): ServiceHealth | null {
+export function readPersistedHealth(agentName?: string): ServiceHealth | null {
   try {
-    if (!existsSync(HEALTH_FILE)) return null;
-    const raw = readFileSync(HEALTH_FILE, "utf-8");
+    const healthFile = buildHealthFilePath(agentName);
+    if (!existsSync(healthFile)) return null;
+    const raw = readFileSync(healthFile, "utf-8");
     return JSON.parse(raw) as ServiceHealth;
   } catch {
     return null;
@@ -102,7 +101,7 @@ function newTracker(): SessionTracker {
 }
 
 export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
-  setHealthFileName(config.agentName);
+  const healthFile = buildHealthFilePath(config.agentName);
   let loopState: ServiceLoopState = "idle";
   const trackers = new Map<string, SessionTracker>();
   let loopTimerId: ReturnType<typeof setInterval> | null = null;
@@ -196,7 +195,7 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
     }
 
     if (eligible.length === 0) {
-      persistHealth({ state: loopState, sessions: buildSessionsSnapshot() });
+      persistHealth(healthFile, { state: loopState, sessions: buildSessionsSnapshot() });
       return;
     }
 
@@ -254,7 +253,7 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
       }
     }
 
-    persistHealth({ state: loopState, sessions: buildSessionsSnapshot() });
+    persistHealth(healthFile, { state: loopState, sessions: buildSessionsSnapshot() });
   }
 
   return {
@@ -277,14 +276,17 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
             tracker.consecutiveErrors = 1;
             tracker.state = "backoff";
             tracker.skipUntilCycle = currentCycle + 2;
-          } else if (res.value.expiresAt) {
-            tracker.expiresAt = new Date(res.value.expiresAt);
+          } else {
+            tracker.state = "polling";
+            if (res.value.expiresAt) {
+              tracker.expiresAt = new Date(res.value.expiresAt);
+            }
           }
         }
         loopState = "running";
         tick();
         loopTimerId = setInterval(() => { tick(); }, config.pollIntervalMs);
-        persistHealth({ state: loopState, sessions: buildSessionsSnapshot() });
+        persistHealth(healthFile, { state: loopState, sessions: buildSessionsSnapshot() });
       });
     },
 
@@ -302,7 +304,7 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
       }
 
       loopState = "stopped";
-      persistHealth({ state: loopState, sessions: buildSessionsSnapshot() });
+      persistHealth(healthFile, { state: loopState, sessions: buildSessionsSnapshot() });
     },
 
     addSession(sessionId: string): void {
@@ -324,12 +326,12 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
         });
       }
 
-      persistHealth({ state: loopState, sessions: buildSessionsSnapshot() });
+      persistHealth(healthFile, { state: loopState, sessions: buildSessionsSnapshot() });
     },
 
     removeSession(sessionId: string): void {
       trackers.delete(sessionId);
-      persistHealth({ state: loopState, sessions: buildSessionsSnapshot() });
+      persistHealth(healthFile, { state: loopState, sessions: buildSessionsSnapshot() });
     },
 
     async forcePoll(sessionId?: string): Promise<ForcePollResult> {
@@ -354,8 +356,18 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
         }
       }
 
+      // Filter out sessions still joining (join not yet completed)
+      const ready = targets.filter((sid) => {
+        const t = trackers.get(sid);
+        return t && t.state !== "joining";
+      });
+
+      if (ready.length === 0) {
+        return { polled: [], messagesReceived: 0 };
+      }
+
       const results = await Promise.allSettled(
-        targets.map((sid) => pollOne(sid))
+        ready.map((sid) => pollOne(sid))
       );
 
       const batch = new Map<string, Message[]>();
@@ -364,7 +376,7 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
 
       for (let i = 0; i < results.length; i++) {
         const result = results[i];
-        const sid = targets[i];
+        const sid = ready[i];
 
         if (result.status === "fulfilled") {
           polled.push(sid);
@@ -402,7 +414,7 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
         };
       }
       const health: ServiceHealth = { state: loopState, sessions };
-      persistHealth(health);
+      persistHealth(healthFile, health);
       return health;
     },
   };

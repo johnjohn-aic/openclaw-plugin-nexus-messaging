@@ -220,7 +220,7 @@ export function registerCliCommands(
         .command("status")
         .description("Show plugin status and health")
         .action(() => {
-          const health = readPersistedHealth() ?? serviceLoop.getHealth();
+          const health = readPersistedHealth(config.agentName) ?? serviceLoop.getHealth();
           const lines: string[] = [
             `Agent: ${config.agentName}`,
             `URL: ${config.url}`,
@@ -245,7 +245,7 @@ export function registerCliCommands(
         .command("sessions")
         .description("List configured sessions and their state")
         .action(() => {
-          const health = readPersistedHealth() ?? serviceLoop.getHealth();
+          const health = readPersistedHealth(config.agentName) ?? serviceLoop.getHealth();
 
           for (const session of config.sessions) {
             const s = health.sessions[session.id];
