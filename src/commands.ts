@@ -3,24 +3,18 @@ import type { Runtime } from "./runtime.js";
 import type { ServiceLoop, ServiceHealth } from "./service-loop.js";
 import { readPersistedHealth } from "./service-loop.js";
 import type { NexusMessagingConfig } from "./config.js";
-
-function resolveLabel(input: string, labels?: Map<string, string>): string {
-  if (!labels) return input;
-  for (const [sessionId, label] of labels) {
-    if (label === input) return sessionId;
-  }
-  return input;
-}
+import { resolveAlias, reverseAliasLookup, writeAlias, removeAlias } from "./aliases.js";
 
 const USAGE = [
   "Usage: /nexus <subcommand>",
   "",
   "Subcommands:",
-  "  status                    Show service loop health",
-  "  send <sessionId> <text>   Send a message to a session",
-  "  join <sessionId>          Join a session",
-  "  leave <sessionId>         Leave a session",
-  "  poll [sessionId]          Force-poll sessions for new messages",
+  "  status                        Show service loop health",
+  "  send <sessionId> <text>       Send a message to a session",
+  "  join <sessionId>              Join a session",
+  "  leave <sessionId>             Leave a session",
+  "  poll [sessionId]              Force-poll sessions for new messages",
+  "  history <sessionId> [limit]   Query past messages without affecting poll cursor",
 ].join("\n");
 
 function formatHealth(health: ServiceHealth): string {
@@ -31,10 +25,12 @@ function formatHealth(health: ServiceHealth): string {
 
   for (const id of sessionIds) {
     const s = health.sessions[id];
+    const alias = reverseAliasLookup(id);
     const parts = [`state=${s.state}`];
     if (s.lastPollAt) parts.push(`lastPoll=${s.lastPollAt}`);
     if (s.consecutiveErrors > 0) parts.push(`errors=${s.consecutiveErrors}`);
-    lines.push(`  ${id}: ${parts.join(", ")}`);
+    const display = alias ? `${id} (${alias})` : id;
+    lines.push(`  ${display}: ${parts.join(", ")}`);
   }
 
   return lines.join("\n");
@@ -63,11 +59,12 @@ async function handleSend(
   if (spaceIdx === -1) {
     return { text: "Usage: /nexus send <sessionId> <text>" };
   }
-  const sessionId = trimmed.slice(0, spaceIdx);
+  const rawId = trimmed.slice(0, spaceIdx);
   const text = trimmed.slice(spaceIdx + 1);
-  if (!sessionId || !text) {
+  if (!rawId || !text) {
     return { text: "Usage: /nexus send <sessionId> <text>" };
   }
+  const sessionId = resolveAlias(rawId);
   try {
     const result = await runtime.send(sessionId, text);
     return {
@@ -85,14 +82,21 @@ async function handleJoin(
   serviceLoop: ServiceLoop,
   args: string,
 ): Promise<{ text: string }> {
-  const sessionId = args.trim();
-  if (!sessionId) {
-    return { text: "Usage: /nexus join <sessionId>" };
+  const parts = args.trim().split(/\s+/);
+  const rawId = parts[0];
+  if (!rawId) {
+    return { text: "Usage: /nexus join <sessionId> [label]" };
   }
+  const sessionId = resolveAlias(rawId);
+  const label = parts[1];
   try {
     const result = await runtime.join(sessionId);
     serviceLoop.addSession(result.sessionId);
-    return { text: `Joined session ${result.sessionId} (key: ${result.sessionKey})` };
+    if (label) {
+      writeAlias(result.sessionId, label);
+    }
+    const display = label ? `${result.sessionId} (alias: ${label})` : result.sessionId;
+    return { text: `Joined session ${display} (key: ${result.sessionKey})` };
   } catch (err: unknown) {
     return { text: formatError(err) };
   }
@@ -103,11 +107,13 @@ async function handleLeave(
   serviceLoop: ServiceLoop,
   args: string,
 ): Promise<{ text: string }> {
-  const sessionId = args.trim();
-  if (!sessionId) {
+  const rawId = args.trim();
+  if (!rawId) {
     return { text: "Usage: /nexus leave <sessionId>" };
   }
+  const sessionId = resolveAlias(rawId);
   serviceLoop.removeSession(sessionId);
+  removeAlias(sessionId);
   try {
     const result = await runtime.leave(sessionId);
     return { text: result.ok ? `Left session ${sessionId}` : `Left session ${sessionId} (poll stopped, server leave failed)` };
@@ -119,10 +125,9 @@ async function handleLeave(
 async function handlePoll(
   serviceLoop: ServiceLoop,
   args: string,
-  sessionLabels?: Map<string, string>,
 ): Promise<{ text: string }> {
   const raw = args.trim() || undefined;
-  const sessionId = raw ? resolveLabel(raw, sessionLabels) : undefined;
+  const sessionId = raw ? resolveAlias(raw) : undefined;
   try {
     const result = await serviceLoop.forcePoll(sessionId);
     const target = sessionId ? `session ${sessionId}` : "all sessions";
@@ -134,15 +139,43 @@ async function handlePoll(
   }
 }
 
+async function handleHistory(
+  runtime: Runtime,
+  args: string,
+): Promise<{ text: string }> {
+  const parts = args.trim().split(/\s+/);
+  const rawId = parts[0];
+  if (!rawId) {
+    return { text: "Usage: /nexus history <sessionId> [limit]" };
+  }
+  const sessionId = resolveAlias(rawId);
+  // NOTE: Fetches all messages from cursor "0" and slices client-side.
+  const limit = parts[1] ? parseInt(parts[1], 10) : 20;
+  if (isNaN(limit) || limit <= 0) {
+    return { text: "Usage: /nexus history <sessionId> [limit]" };
+  }
+  try {
+    const result = await runtime.poll(sessionId, "0");
+    const messages = result.messages.slice(-limit);
+    if (messages.length === 0) {
+      return { text: `History for ${sessionId}: no messages found` };
+    }
+    const lines = messages.map((m) => `[${m.timestamp}] ${m.agentId}: ${m.text}`);
+    const header = `History for ${sessionId}: ${messages.length} message(s)`;
+    return { text: `${header}\n${lines.join("\n")}` };
+  } catch (err: unknown) {
+    return { text: formatError(err) };
+  }
+}
+
 export function registerSlashCommands(
   api: any,
   runtime: Runtime,
   serviceLoop: ServiceLoop,
-  sessionLabels?: Map<string, string>,
 ): void {
   api.registerCommand({
     name: "nexus",
-    description: "NexusMessaging commands: status, send, join, leave, poll",
+    description: "NexusMessaging commands: status, send, join, leave, poll, history",
     acceptsArgs: true,
     requireAuth: true,
     handler: async (ctx: { args?: string }) => {
@@ -161,7 +194,9 @@ export function registerSlashCommands(
         case "leave":
           return handleLeave(runtime, serviceLoop, rest);
         case "poll":
-          return handlePoll(serviceLoop, rest, sessionLabels);
+          return handlePoll(serviceLoop, rest);
+        case "history":
+          return handleHistory(runtime, rest);
         default:
           return { text: USAGE };
       }
@@ -185,9 +220,6 @@ export function registerCliCommands(
         .command("status")
         .description("Show plugin status and health")
         .action(() => {
-          // CLI runs in a separate process — read persisted health from disk
-          // (written by the gateway process service loop). Fall back to
-          // in-process getHealth() for the gateway process itself.
           const health = readPersistedHealth() ?? serviceLoop.getHealth();
           const lines: string[] = [
             `Agent: ${config.agentName}`,
@@ -198,10 +230,12 @@ export function registerCliCommands(
 
           for (const id of Object.keys(health.sessions)) {
             const s = health.sessions[id];
+            const alias = reverseAliasLookup(id);
             const parts = [`state=${s.state}`];
             if (s.lastPollAt) parts.push(`lastPoll=${s.lastPollAt}`);
             if (s.consecutiveErrors > 0) parts.push(`errors=${s.consecutiveErrors}`);
-            lines.push(`  ${id}: ${parts.join(", ")}`);
+            const display = alias ? `${id} (${alias})` : id;
+            lines.push(`  ${display}: ${parts.join(", ")}`);
           }
 
           process.stdout.write(lines.join("\n") + "\n");

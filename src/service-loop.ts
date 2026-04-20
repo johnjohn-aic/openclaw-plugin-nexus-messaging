@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import type { Runtime, RenewResult, Message } from "./runtime.js";
 import { RuntimeError } from "./runtime.js";
 
-const HEALTH_FILE = resolve(tmpdir(), "nexus-messaging-health.json");
+let HEALTH_FILE = resolve(tmpdir(), "nexus-messaging-health.json");
+
+function setHealthFileName(agentName?: string): void {
+  const suffix = agentName ? `-${agentName.replace(/[^a-zA-Z0-9_-]/g, "_")}` : "";
+  HEALTH_FILE = resolve(tmpdir(), `nexus-messaging-health${suffix}.json`);
+}
 
 function persistHealth(health: ServiceHealth): void {
   try {
@@ -54,6 +59,7 @@ export interface ServiceLoopConfig {
   sessions: string[];
   pollIntervalMs: number;
   autoRejoin: boolean;
+  agentName?: string;
   onMessage: (batch: Map<string, Message[]>) => void;
 }
 
@@ -96,6 +102,7 @@ function newTracker(): SessionTracker {
 }
 
 export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
+  setHealthFileName(config.agentName);
   let loopState: ServiceLoopState = "idle";
   const trackers = new Map<string, SessionTracker>();
   let loopTimerId: ReturnType<typeof setInterval> | null = null;
@@ -183,7 +190,7 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
 
     const eligible: string[] = [];
     for (const [sessionId, tracker] of trackers) {
-      if (tracker.skipUntilCycle <= cycle && tracker.state !== "stopped") {
+      if (tracker.skipUntilCycle <= cycle && tracker.state !== "stopped" && tracker.state !== "joining") {
         eligible.push(sessionId);
       }
     }
@@ -306,6 +313,7 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
       if (loopState === "running") {
         tracker.state = "joining";
         config.runtime.join(sessionId).then((result) => {
+          tracker.state = "polling";
           if (result.expiresAt) {
             tracker.expiresAt = new Date(result.expiresAt);
           }

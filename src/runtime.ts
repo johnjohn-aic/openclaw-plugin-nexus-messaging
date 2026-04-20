@@ -90,7 +90,6 @@ export interface Runtime {
   send(sessionId: string, text: string): Promise<SendResult>;
   leave(sessionId: string): Promise<LeaveResult>;
   status(sessionId: string): Promise<StatusResult>;
-  heartbeat(sessionId: string): Promise<PollResult>;
   renew(sessionId: string, ttl?: number): Promise<RenewResult>;
 }
 
@@ -114,9 +113,10 @@ function classifyError(
 
   if (
     lower.includes("expired") ||
-    lower.includes("not found") ||
+    lower.includes("session not found") ||
+    lower.includes("session_not_found") ||
     lower.includes("not_found") ||
-    lower.includes("404")
+    (lower.includes("404") && !lower.includes("command not found"))
   ) {
     return new RuntimeError("session-expired", combined, {
       sessionId,
@@ -305,14 +305,6 @@ export function createRuntime(config: NexusMessagingConfig): Runtime {
         sessionId
       );
       return parseJson<StatusResult>(raw, sessionId);
-    },
-
-    async heartbeat(sessionId: string): Promise<PollResult> {
-      const raw = await execCli(
-        ["poll", sessionId, "--url", config.url],
-        sessionId
-      );
-      return parseJson<PollResult>(raw, sessionId);
     },
 
     async renew(sessionId: string, ttl?: number): Promise<RenewResult> {

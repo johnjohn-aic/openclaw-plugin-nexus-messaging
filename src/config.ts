@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
 
@@ -140,7 +140,7 @@ export function discoverLocalSessions(
   let aliasMap = new Map<string, string>();
   try {
     if (existsSync(aliasesFile)) {
-      const raw = require("fs").readFileSync(aliasesFile, "utf-8");
+      const raw = readFileSync(aliasesFile, "utf-8");
       const aliases = JSON.parse(raw) as Record<string, string>;
       for (const [label, sid] of Object.entries(aliases)) {
         if (typeof sid === "string" && sid.trim()) {
@@ -159,7 +159,7 @@ export function discoverLocalSessions(
   const discovered: NexusSessionConfig[] = [];
   try {
     if (!existsSync(dataDir)) return discovered;
-    const entries = require("fs").readdirSync(dataDir, { withFileTypes: true });
+    const entries = readdirSync(dataDir, { withFileTypes: true });
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       const sid = entry.name;

@@ -3,6 +3,7 @@ import { createRuntime, type Runtime, type Message } from "./src/runtime.js";
 import { createServiceLoop } from "./src/service-loop.js";
 import { registerTools } from "./src/tools.js";
 import { registerSlashCommands, registerCliCommands } from "./src/commands.js";
+import { reverseAliasLookup } from "./src/aliases.js";
 
 /**
  * Resolve the delivery session key for a Nexus session.
@@ -72,19 +73,11 @@ export default function register(api: any): void {
     );
   }
 
-  // Build a label map for human-readable session names in events
-  const sessionLabels = new Map<string, string>();
-  for (const s of allSessions) {
-    if (s.label) sessionLabels.set(s.id, s.label);
-  }
-
   // Resolve the agent's main session key for system event injection.
   // The session key format is "agent:<agentId>:<mainKey>" (e.g. "agent:main:main").
   // We resolve it from the config so events land in the correct agent session.
   let agentSessionKey: string;
   try {
-    const resolveMainKey = api.runtime?.channel?.routing?.buildAgentSessionKey;
-    // Use resolveMainSessionKeyFromConfig if available (most reliable)
     const cfg = api.config;
     const agents = cfg?.agents?.list ?? [];
     const defaultAgent = agents.find((a: any) => a?.default);
@@ -94,7 +87,6 @@ export default function register(api: any): void {
     if (cfg?.session?.scope === "global") {
       agentSessionKey = "global";
     } else {
-      // Standard format: "agent:<agentId>:<mainKey>"
       agentSessionKey = `agent:${agentId}:${mainKey}`;
     }
   } catch {
@@ -157,7 +149,7 @@ export default function register(api: any): void {
 
     if (filtered.size === 1) {
       const [sessionId, agentMessages] = filtered.entries().next().value as [string, Message[]];
-      const label = sessionLabels.get(sessionId) ?? sessionId.slice(0, 8);
+      const label = reverseAliasLookup(sessionId) ?? sessionId.slice(0, 8);
       const lines = agentMessages.map((m) => `${m.agentId}: ${m.text}`);
       const header = agentMessages.length === 1
         ? `[NexusMessaging:${label}] New message (session: ${sessionId})`
@@ -169,7 +161,7 @@ export default function register(api: any): void {
       let totalMessages = 0;
       for (const [sessionId, agentMessages] of filtered) {
         totalMessages += agentMessages.length;
-        const label = sessionLabels.get(sessionId) ?? sessionId.slice(0, 8);
+        const label = reverseAliasLookup(sessionId) ?? sessionId.slice(0, 8);
         const lines = agentMessages.map((m) => `${m.agentId}: ${m.text}`);
         parts.push(`📨 ${label} (session: ${sessionId}) — ${agentMessages.length} message${agentMessages.length === 1 ? "" : "s"}\n${lines.join("\n")}`);
       }
@@ -202,6 +194,7 @@ export default function register(api: any): void {
     sessions: allSessions.map((s: { id: string }) => s.id),
     pollIntervalMs: config.pollIntervalMs,
     autoRejoin: config.autoRejoin,
+    agentName: config.agentName,
     onMessage: (batch) => {
       for (const [sessionId, messages] of batch) {
         const agentMsgs = messages.filter((m) => m.agentId !== "system");
@@ -215,8 +208,8 @@ export default function register(api: any): void {
     },
   });
 
-  registerTools(api, runtime, serviceLoop, sessionLabels);
-  registerSlashCommands(api, runtime, serviceLoop, sessionLabels);
+  registerTools(api, runtime, serviceLoop);
+  registerSlashCommands(api, runtime, serviceLoop);
   registerCliCommands(api, runtime, serviceLoop, config);
 
   api.registerService({

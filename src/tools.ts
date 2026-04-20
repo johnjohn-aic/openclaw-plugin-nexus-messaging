@@ -1,19 +1,7 @@
 import { RuntimeError } from "./runtime.js";
 import type { Runtime } from "./runtime.js";
 import type { ServiceLoop } from "./service-loop.js";
-
-/**
- * Resolve a label to a sessionId. If the input matches a label in the map,
- * return the corresponding sessionId. Otherwise return the input as-is
- * (assumed to be a sessionId already).
- */
-function resolveLabel(input: string, labels?: Map<string, string>): string {
-  if (!labels) return input;
-  for (const [sessionId, label] of labels) {
-    if (label === input) return sessionId;
-  }
-  return input;
-}
+import { resolveAlias, writeAlias, removeAlias, readAliases, reverseAliasLookup } from "./aliases.js";
 
 function mcpOk(result: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
@@ -44,7 +32,6 @@ export function registerTools(
   api: any,
   runtime: Runtime,
   serviceLoop: ServiceLoop,
-  sessionLabels?: Map<string, string>,
 ): void {
   api.registerTool(
     {
@@ -63,7 +50,8 @@ export function registerTools(
         params: { sessionId: string; text: string },
       ) {
         try {
-          const result = await runtime.send(params.sessionId, params.text);
+          const sessionId = resolveAlias(params.sessionId);
+          const result = await runtime.send(sessionId, params.text);
           return mcpOk(result);
         } catch (err: unknown) {
           return mcpError(err);
@@ -90,7 +78,8 @@ export function registerTools(
         params: { sessionId: string; after?: string },
       ) {
         try {
-          const result = await runtime.poll(params.sessionId, params.after);
+          const sessionId = resolveAlias(params.sessionId);
+          const result = await runtime.poll(sessionId, params.after);
           return mcpOk(result);
         } catch (err: unknown) {
           return mcpError(err);
@@ -113,7 +102,8 @@ export function registerTools(
       },
       async execute(_id: string, params: { sessionId: string }) {
         try {
-          const result = await runtime.status(params.sessionId);
+          const sessionId = resolveAlias(params.sessionId);
+          const result = await runtime.status(sessionId);
           return mcpOk(result);
         } catch (err: unknown) {
           return mcpError(err);
@@ -138,11 +128,9 @@ export function registerTools(
       async execute(_id: string, params: { sessionId: string; label?: string }) {
         try {
           const result = await runtime.join(params.sessionId);
-          // Hot-reload: add to poll loop immediately
           serviceLoop.addSession(params.sessionId);
-          // Store label if provided
-          if (params.label && sessionLabels) {
-            sessionLabels.set(params.sessionId, params.label);
+          if (params.label) {
+            writeAlias(params.sessionId, params.label);
           }
           return mcpOk({ ...result, polling: true, label: params.label ?? null });
         } catch (err: unknown) {
@@ -165,15 +153,12 @@ export function registerTools(
         required: ["sessionId"],
       },
       async execute(_id: string, params: { sessionId: string }) {
-        // Always remove from poll loop, even if server leave fails
-        // (session may already be expired on server)
         serviceLoop.removeSession(params.sessionId);
-        sessionLabels?.delete(params.sessionId);
+        removeAlias(params.sessionId);
         try {
           const result = await runtime.leave(params.sessionId);
           return mcpOk({ ...result, polling: false });
         } catch (err: unknown) {
-          // Still stopped polling even if server returned an error
           return mcpOk({ sessionId: params.sessionId, polling: false, serverLeave: "failed (session may be expired)" });
         }
       },
@@ -209,13 +194,13 @@ export function registerTools(
       parameters: {
         type: "object",
         properties: {
-          sessionId: { type: "string", description: "Optional session ID or label to poll; if omitted, all tracked sessions are polled" },
+          sessionId: { type: "string", description: "Optional session ID or alias to poll; if omitted, all tracked sessions are polled" },
         },
         required: [],
       },
       async execute(_id: string, params: { sessionId?: string }) {
         try {
-          const resolved = params.sessionId ? resolveLabel(params.sessionId, sessionLabels) : undefined;
+          const resolved = params.sessionId ? resolveAlias(params.sessionId) : undefined;
           const result = await serviceLoop.forcePoll(resolved);
           return mcpOk({ ok: true, ...result });
         } catch (err: unknown) {
@@ -228,9 +213,43 @@ export function registerTools(
 
   api.registerTool(
     {
+      name: "nexus_history",
+      description:
+        "Query past messages from a NexusMessaging session without altering the service-loop poll cursor. Returns the last N messages from the session history.",
+      parameters: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string", description: "Session ID or alias to query" },
+          limit: { type: "number", description: "Maximum number of messages to return (default: 20)" },
+          after: { type: "string", description: "Cursor to start querying from; defaults to \"0\" for full history" },
+        },
+        required: ["sessionId"],
+      },
+      async execute(
+        _id: string,
+        params: { sessionId: string; limit?: number; after?: string },
+      ) {
+        try {
+          const sessionId = resolveAlias(params.sessionId);
+          // NOTE: This fetches ALL messages from cursor and slices client-side.
+          // When the server adds ?limit=N support, pass it to runtime.poll().
+          const limit = params.limit ?? 20;
+          const result = await runtime.poll(sessionId, params.after ?? "0");
+          const messages = result.messages.slice(-limit);
+          return mcpOk({ ...result, messages });
+        } catch (err: unknown) {
+          return mcpError(err);
+        }
+      },
+    },
+    { optional: true },
+  );
+
+  api.registerTool(
+    {
       name: "nexus_sessions",
       description:
-        "List all NexusMessaging sessions the agent is connected to, with labels, poll state, and errors. Use this to know which sessions are active and their IDs before sending messages.",
+        "List all NexusMessaging sessions the agent is connected to, with aliases, poll state, and errors. Use this to know which sessions are active and their IDs before sending messages.",
       parameters: {
         type: "object",
         properties: {},
@@ -239,10 +258,11 @@ export function registerTools(
       async execute() {
         try {
           const health = serviceLoop.getHealth();
+          const aliases = readAliases();
           const sessions = Object.entries(health.sessions).map(
             ([sessionId, sh]) => ({
               sessionId,
-              label: sessionLabels?.get(sessionId) ?? null,
+              alias: reverseAliasLookup(sessionId, aliases) ?? null,
               state: sh.state,
               lastPollAt: sh.lastPollAt,
               cursor: sh.cursor,
