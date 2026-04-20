@@ -9,7 +9,7 @@ const USAGE = [
   "Usage: /nexus <command>",
   "",
   "Commands:",
-  "  status                              Show active sessions and their state",
+  "  status [session|alias]              Show service overview, or session details + active members",
   "  send <session|alias> <text>         Send a message to a session",
   "  join <sessionId> [alias]            Join a session (alias lets you use a name instead of UUID)",
   "  leave <session|alias>               Leave a session and stop receiving messages",
@@ -58,10 +58,63 @@ function formatError(err: unknown): string {
 }
 
 async function handleStatus(
+  runtime: Runtime,
   serviceLoop: ServiceLoop,
+  args: string,
 ): Promise<{ text: string }> {
-  const health = serviceLoop.getHealth();
-  return { text: formatHealth(health) };
+  const rawId = args.trim();
+
+  // No argument → show service loop health (overview)
+  if (!rawId) {
+    const health = serviceLoop.getHealth();
+    return { text: formatHealth(health) };
+  }
+
+  // With argument → show session details + members
+  const sessionId = resolveAlias(rawId);
+  const display = rawId !== sessionId ? `${rawId} (${sessionId})` : sessionId;
+  try {
+    const [status, pollWithMembers] = await Promise.all([
+      runtime.status(sessionId),
+      runtime.pollMembers(sessionId),
+    ]);
+    const members = pollWithMembers.members ?? [];
+
+    const lines: string[] = [`📋 ${display}`, ""];
+
+    // Expiry
+    const expiresAt = new Date(status.expiresAt);
+    const msLeft = expiresAt.getTime() - Date.now();
+    const timeLeft = msLeft > 0
+      ? msLeft < 3600000 ? `${Math.round(msLeft / 60000)}m` : `${Math.round(msLeft / 3600000)}h`
+      : "expired";
+    lines.push(`  Expires: ${status.expiresAt} (${timeLeft} left)`);
+    lines.push(`  Max agents: ${status.maxAgents}`);
+    lines.push("");
+
+    // Agents (joined)
+    lines.push(`  Agents (${status.agents.length} joined):`);
+    for (const a of status.agents) {
+      const ago = Math.round((Date.now() - new Date(a.joinedAt).getTime()) / 60000);
+      const agoStr = ago < 60 ? `${ago}m ago` : `${Math.round(ago / 60)}h ago`;
+      lines.push(`    • ${a.agentId} — joined ${agoStr}`);
+    }
+
+    // Members (active)
+    if (members.length > 0) {
+      lines.push("");
+      lines.push(`  Active recently (${members.length}):`);
+      for (const m of members) {
+        const ago = Math.round((Date.now() - new Date(m.lastSeenAt).getTime()) / 60000);
+        const agoStr = ago < 60 ? `${ago}m ago` : `${Math.round(ago / 60)}h ago`;
+        lines.push(`    • ${m.agentId} — last seen ${agoStr}`);
+      }
+    }
+
+    return { text: lines.join("\n") };
+  } catch (err: unknown) {
+    return { text: `❌ ${formatError(err)}` };
+  }
 }
 
 async function handleSend(
@@ -207,7 +260,7 @@ export function registerSlashCommands(
 
       switch (sub) {
         case "status":
-          return handleStatus(serviceLoop);
+          return handleStatus(runtime, serviceLoop, rest);
         case "send":
           return handleSend(runtime, rest);
         case "join":

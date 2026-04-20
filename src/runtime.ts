@@ -89,6 +89,7 @@ export interface StatusResult {
 export interface Runtime {
   join(sessionId: string): Promise<JoinResult>;
   poll(sessionId: string, after?: string): Promise<PollResult>;
+  pollMembers(sessionId: string): Promise<PollResult>;
   send(sessionId: string, text: string): Promise<SendResult>;
   leave(sessionId: string): Promise<LeaveResult>;
   status(sessionId: string): Promise<StatusResult>;
@@ -295,6 +296,12 @@ export function createRuntime(config: NexusMessagingConfig): Runtime {
       if (after !== undefined) {
         args.push("--after", after);
       }
+      const raw = await execCli(args, sessionId);
+      return parseJson<PollResult>(raw, sessionId);
+    },
+
+    async pollMembers(sessionId: string): Promise<PollResult> {
+      const args = ["poll", sessionId, "--url", config.url, "--members"];
       const raw = await execCli(args, sessionId);
       return parseJson<PollResult>(raw, sessionId);
     },

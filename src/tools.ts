@@ -92,7 +92,7 @@ export function registerTools(
   api.registerTool(
     {
       name: "nexus_status",
-      description: "Get detailed info about a NexusMessaging session: who created it, when it expires, and which agents are currently connected. Useful for checking if a session is still alive or who's in it.",
+      description: "Get detailed info about a NexusMessaging session: who created it, when it expires, which agents joined, and who was recently active. Useful for checking if a session is still alive or who's actively participating.",
       parameters: {
         type: "object",
         properties: {
@@ -103,8 +103,11 @@ export function registerTools(
       async execute(_id: string, params: { sessionId: string }) {
         try {
           const sessionId = resolveAlias(params.sessionId);
-          const result = await runtime.status(sessionId);
-          return mcpOk(result);
+          const [status, pollWithMembers] = await Promise.all([
+            runtime.status(sessionId),
+            runtime.pollMembers(sessionId),
+          ]);
+          return mcpOk({ ...status, members: pollWithMembers.members ?? [] });
         } catch (err: unknown) {
           return mcpError(err);
         }
