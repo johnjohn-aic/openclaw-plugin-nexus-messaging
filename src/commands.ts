@@ -4,6 +4,14 @@ import type { ServiceLoop, ServiceHealth } from "./service-loop.js";
 import { readPersistedHealth } from "./service-loop.js";
 import type { NexusMessagingConfig } from "./config.js";
 
+function resolveLabel(input: string, labels?: Map<string, string>): string {
+  if (!labels) return input;
+  for (const [sessionId, label] of labels) {
+    if (label === input) return sessionId;
+  }
+  return input;
+}
+
 const USAGE = [
   "Usage: /nexus <subcommand>",
   "",
@@ -111,8 +119,10 @@ async function handleLeave(
 async function handlePoll(
   serviceLoop: ServiceLoop,
   args: string,
+  sessionLabels?: Map<string, string>,
 ): Promise<{ text: string }> {
-  const sessionId = args.trim() || undefined;
+  const raw = args.trim() || undefined;
+  const sessionId = raw ? resolveLabel(raw, sessionLabels) : undefined;
   try {
     const result = await serviceLoop.forcePoll(sessionId);
     const target = sessionId ? `session ${sessionId}` : "all sessions";
@@ -128,6 +138,7 @@ export function registerSlashCommands(
   api: any,
   runtime: Runtime,
   serviceLoop: ServiceLoop,
+  sessionLabels?: Map<string, string>,
 ): void {
   api.registerCommand({
     name: "nexus",
@@ -150,7 +161,7 @@ export function registerSlashCommands(
         case "leave":
           return handleLeave(runtime, serviceLoop, rest);
         case "poll":
-          return handlePoll(serviceLoop, rest);
+          return handlePoll(serviceLoop, rest, sessionLabels);
         default:
           return { text: USAGE };
       }

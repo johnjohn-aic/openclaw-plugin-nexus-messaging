@@ -2,6 +2,19 @@ import { RuntimeError } from "./runtime.js";
 import type { Runtime } from "./runtime.js";
 import type { ServiceLoop } from "./service-loop.js";
 
+/**
+ * Resolve a label to a sessionId. If the input matches a label in the map,
+ * return the corresponding sessionId. Otherwise return the input as-is
+ * (assumed to be a sessionId already).
+ */
+function resolveLabel(input: string, labels?: Map<string, string>): string {
+  if (!labels) return input;
+  for (const [sessionId, label] of labels) {
+    if (label === input) return sessionId;
+  }
+  return input;
+}
+
 function mcpOk(result: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
 }
@@ -196,13 +209,14 @@ export function registerTools(
       parameters: {
         type: "object",
         properties: {
-          sessionId: { type: "string", description: "Optional session ID to poll; if omitted, all tracked sessions are polled" },
+          sessionId: { type: "string", description: "Optional session ID or label to poll; if omitted, all tracked sessions are polled" },
         },
         required: [],
       },
       async execute(_id: string, params: { sessionId?: string }) {
         try {
-          const result = await serviceLoop.forcePoll(params.sessionId);
+          const resolved = params.sessionId ? resolveLabel(params.sessionId, sessionLabels) : undefined;
+          const result = await serviceLoop.forcePoll(resolved);
           return mcpOk({ ok: true, ...result });
         } catch (err: unknown) {
           return mcpError(err);

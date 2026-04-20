@@ -216,7 +216,7 @@ export default function register(api: any): void {
   });
 
   registerTools(api, runtime, serviceLoop, sessionLabels);
-  registerSlashCommands(api, runtime, serviceLoop);
+  registerSlashCommands(api, runtime, serviceLoop, sessionLabels);
   registerCliCommands(api, runtime, serviceLoop, config);
 
   api.registerService({
