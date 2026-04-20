@@ -153,13 +153,14 @@ export function registerTools(
         required: ["sessionId"],
       },
       async execute(_id: string, params: { sessionId: string }) {
-        serviceLoop.removeSession(params.sessionId);
-        removeAlias(params.sessionId);
+        const sessionId = resolveAlias(params.sessionId);
+        serviceLoop.removeSession(sessionId);
+        removeAlias(sessionId);
         try {
-          const result = await runtime.leave(params.sessionId);
-          return mcpOk({ ...result, polling: false });
+          const result = await runtime.leave(sessionId);
+          return mcpOk({ ...result, sessionId, polling: false });
         } catch (err: unknown) {
-          return mcpOk({ sessionId: params.sessionId, polling: false, serverLeave: "failed (session may be expired)" });
+          return mcpOk({ sessionId, polling: false, serverLeave: "failed (session may be expired)" });
         }
       },
     },
