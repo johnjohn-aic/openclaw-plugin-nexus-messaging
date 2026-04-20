@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { existsSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { promisify } from "node:util";
 import { arch, homedir, tmpdir } from "node:os";
@@ -184,13 +184,28 @@ export function createRuntime(config: NexusMessagingConfig): Runtime {
 
   // Create a /tmp wrapper dir with a `jq` script pointing to the right binary.
   // /tmp is always writable, even when plugin dir is mounted read-only.
+  // IMPORTANT: Always overwrite the wrapper to avoid stale/recursive scripts
+  // from previous plugin versions (see: infinite recursion bug in v0.5.0).
   const jqWrapperDir = resolve(tmpdir(), "nexus-messaging-bin");
   const jqWrapperPath = resolve(jqWrapperDir, "jq");
+  const expectedContent = `#!/bin/sh\nexec "${jqBundled}" "$@"\n`;
 
-  if (existsSync(jqBundled) && !existsSync(jqWrapperPath)) {
+  if (existsSync(jqBundled)) {
     try {
-      mkdirSync(jqWrapperDir, { recursive: true });
-      writeFileSync(jqWrapperPath, `#!/bin/sh\nexec "${jqBundled}" "$@"\n`, { mode: 0o755 });
+      // Always write — ensures stale wrappers from older versions are replaced
+      let needsWrite = true;
+      if (existsSync(jqWrapperPath)) {
+        try {
+          const current = readFileSync(jqWrapperPath, "utf-8");
+          if (current === expectedContent) needsWrite = false;
+        } catch {
+          // can't read → overwrite
+        }
+      }
+      if (needsWrite) {
+        mkdirSync(jqWrapperDir, { recursive: true });
+        writeFileSync(jqWrapperPath, expectedContent, { mode: 0o755 });
+      }
     } catch {
       // best-effort — if /tmp is somehow not writable, jq must be in system PATH
     }
