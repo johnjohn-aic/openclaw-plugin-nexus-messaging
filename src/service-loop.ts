@@ -1,7 +1,7 @@
 import { writeFileSync, readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { tmpdir } from "node:os";
-import type { Runtime, Message } from "./runtime.js";
+import type { Runtime, RenewResult, Message } from "./runtime.js";
 import { RuntimeError } from "./runtime.js";
 
 const HEALTH_FILE = resolve(tmpdir(), "nexus-messaging-health.json");
@@ -79,6 +79,8 @@ interface SessionTracker {
   lastPollAt: string | null;
   state: SessionPollState;
   skipUntilCycle: number;
+  expiresAt: Date | null;
+  ttl: number | null;
 }
 
 function newTracker(): SessionTracker {
@@ -88,6 +90,8 @@ function newTracker(): SessionTracker {
     lastPollAt: null,
     state: "joining",
     skipUntilCycle: 0,
+    expiresAt: null,
+    ttl: null,
   };
 }
 
@@ -121,6 +125,12 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
     tracker.consecutiveErrors = 0;
     tracker.state = "polling";
 
+    // Post-poll expiry estimation: if messages were received and TTL is known,
+    // the server has reset the sliding window, so estimate new expiresAt
+    if (result.messages.length > 0 && tracker.ttl !== null) {
+      tracker.expiresAt = new Date(Date.now() + tracker.ttl * 1000);
+    }
+
     return { sessionId, messages: result.messages };
   }
 
@@ -139,10 +149,13 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
         `[nexus-messaging] Session ${sessionId} error (${err.code}), attempting auto-rejoin`
       );
       try {
-        await config.runtime.join(sessionId);
+        const rejoinResult = await config.runtime.join(sessionId);
         tracker.cursor = undefined;
         tracker.consecutiveErrors = 0;
         tracker.state = "polling";
+        if (rejoinResult.expiresAt) {
+          tracker.expiresAt = new Date(rejoinResult.expiresAt);
+        }
         return;
       } catch (rejoinErr: unknown) {
         console.error(
@@ -178,6 +191,30 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
     if (eligible.length === 0) {
       persistHealth({ state: loopState, sessions: buildSessionsSnapshot() });
       return;
+    }
+
+    // Renewal pass — renew sessions approaching expiry BEFORE polling
+    const now = Date.now();
+    for (const sid of eligible) {
+      const tracker = trackers.get(sid);
+      if (
+        tracker &&
+        tracker.expiresAt !== null &&
+        tracker.state !== "backoff" &&
+        now + config.pollIntervalMs * 2 >= tracker.expiresAt.getTime()
+      ) {
+        try {
+          const renewResult = await config.runtime.renew(sid);
+          tracker.expiresAt = new Date(renewResult.expiresAt);
+          tracker.ttl = renewResult.ttl;
+        } catch (renewErr: unknown) {
+          console.warn(
+            `[nexus-messaging] Renewal failed for session ${sid} (will still attempt poll):`,
+            renewErr
+          );
+          // Do NOT increment errors or enter backoff — poll will detect actual death
+        }
+      }
     }
 
     const results = await Promise.allSettled(
@@ -226,13 +263,15 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
         config.sessions.map((sid) => config.runtime.join(sid))
       ).then((results) => {
         for (let i = 0; i < results.length; i++) {
-          if (results[i].status === "rejected") {
-            const tracker = trackers.get(config.sessions[i]);
-            if (tracker) {
-              tracker.consecutiveErrors = 1;
-              tracker.state = "backoff";
-              tracker.skipUntilCycle = currentCycle + 2;
-            }
+          const tracker = trackers.get(config.sessions[i]);
+          if (!tracker) continue;
+          const res = results[i];
+          if (res.status === "rejected") {
+            tracker.consecutiveErrors = 1;
+            tracker.state = "backoff";
+            tracker.skipUntilCycle = currentCycle + 2;
+          } else if (res.value.expiresAt) {
+            tracker.expiresAt = new Date(res.value.expiresAt);
           }
         }
         loopState = "running";
@@ -266,7 +305,11 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
 
       if (loopState === "running") {
         tracker.state = "joining";
-        config.runtime.join(sessionId).catch(() => {
+        config.runtime.join(sessionId).then((result) => {
+          if (result.expiresAt) {
+            tracker.expiresAt = new Date(result.expiresAt);
+          }
+        }).catch(() => {
           tracker.consecutiveErrors++;
           tracker.skipUntilCycle = currentCycle + 2;
           tracker.state = "backoff";

@@ -58,6 +58,13 @@ export interface PollResult {
 export interface JoinResult {
   sessionId: string;
   sessionKey: string;
+  expiresAt?: string;
+}
+
+export interface RenewResult {
+  sessionId: string;
+  ttl: number;
+  expiresAt: string;
 }
 
 export interface SendResult {
@@ -84,6 +91,7 @@ export interface Runtime {
   leave(sessionId: string): Promise<LeaveResult>;
   status(sessionId: string): Promise<StatusResult>;
   heartbeat(sessionId: string): Promise<PollResult>;
+  renew(sessionId: string, ttl?: number): Promise<RenewResult>;
 }
 
 function classifyError(
@@ -305,6 +313,15 @@ export function createRuntime(config: NexusMessagingConfig): Runtime {
         sessionId
       );
       return parseJson<PollResult>(raw, sessionId);
+    },
+
+    async renew(sessionId: string, ttl?: number): Promise<RenewResult> {
+      const args = ["renew", sessionId, "--url", config.url];
+      if (ttl !== undefined) {
+        args.push("--ttl", String(ttl));
+      }
+      const raw = await execCli(args, sessionId);
+      return parseJson<RenewResult>(raw, sessionId);
     },
   };
 }
