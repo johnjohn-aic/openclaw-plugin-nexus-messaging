@@ -36,12 +36,12 @@ export function registerTools(
   api.registerTool(
     {
       name: "nexus_send",
-      description: "Send a message to a NexusMessaging session",
+      description: "Send a message to another agent in a NexusMessaging session. All agents in that session will see the message on their next poll. Use nexus_sessions to find available session IDs/aliases.",
       parameters: {
         type: "object",
         properties: {
-          sessionId: { type: "string" },
-          text: { type: "string" },
+          sessionId: { type: "string", description: "Session ID or alias to send to (e.g. \"chatbot\" or a UUID). Use nexus_sessions to discover available sessions." },
+          text: { type: "string", description: "Message text to send. Will be visible to all agents in the session." },
         },
         required: ["sessionId", "text"],
       },
@@ -64,12 +64,12 @@ export function registerTools(
   api.registerTool(
     {
       name: "nexus_poll",
-      description: "Poll messages from a NexusMessaging session",
+      description: "Check for new messages in a NexusMessaging session since the last poll. Only returns messages you haven't seen yet (advances the cursor). For reading past messages without advancing the cursor, use nexus_history instead.",
       parameters: {
         type: "object",
         properties: {
-          sessionId: { type: "string" },
-          after: { type: "string" },
+          sessionId: { type: "string", description: "Session ID or alias to poll. Use nexus_sessions to list available sessions." },
+          after: { type: "string", description: "Only return messages after this cursor. Omit to continue from where the last poll left off." },
         },
         required: ["sessionId"],
       },
@@ -92,11 +92,11 @@ export function registerTools(
   api.registerTool(
     {
       name: "nexus_status",
-      description: "Get the status of a NexusMessaging session",
+      description: "Get detailed info about a NexusMessaging session: who created it, when it expires, and which agents are currently connected. Useful for checking if a session is still alive or who's in it.",
       parameters: {
         type: "object",
         properties: {
-          sessionId: { type: "string" },
+          sessionId: { type: "string", description: "Session ID or alias to inspect. Use nexus_sessions to list available sessions." },
         },
         required: ["sessionId"],
       },
@@ -116,12 +116,12 @@ export function registerTools(
   api.registerTool(
     {
       name: "nexus_join",
-      description: "Join a NexusMessaging session and start polling it automatically",
+      description: "Join a NexusMessaging session. After joining, new messages will be delivered to you automatically via the background poll loop. Give it a label so you can refer to it by name instead of UUID.",
       parameters: {
         type: "object",
         properties: {
-          sessionId: { type: "string" },
-          label: { type: "string", description: "Human-readable label for this session" },
+          sessionId: { type: "string", description: "Session ID (UUID) to join. You'll get this from whoever created the session or from a pairing link." },
+          label: { type: "string", description: "Short name for this session (e.g. \"team-chat\", \"research\"). You can use this alias instead of the UUID in all other nexus tools." },
         },
         required: ["sessionId"],
       },
@@ -144,11 +144,11 @@ export function registerTools(
   api.registerTool(
     {
       name: "nexus_leave",
-      description: "Leave a NexusMessaging session and stop polling it",
+      description: "Leave a NexusMessaging session and stop receiving messages from it. Removes the session from your active list and deletes its alias. You can rejoin later with nexus_join if needed.",
       parameters: {
         type: "object",
         properties: {
-          sessionId: { type: "string" },
+          sessionId: { type: "string", description: "Session ID or alias to leave. Use nexus_sessions to see which sessions you're in." },
         },
         required: ["sessionId"],
       },
@@ -169,7 +169,7 @@ export function registerTools(
   api.registerTool(
     {
       name: "nexus_health",
-      description: "Get the health status of the NexusMessaging service loop",
+      description: "Check if the NexusMessaging background service is running correctly. Shows the overall service state and per-session poll status. Use this to diagnose delivery problems or check if polling is active.",
       parameters: {
         type: "object",
         properties: {},
@@ -190,11 +190,11 @@ export function registerTools(
   api.registerTool(
     {
       name: "nexus_force_poll",
-      description: "Force-poll one or all tracked NexusMessaging sessions for new messages immediately, bypassing the normal poll interval and backoff",
+      description: "Check for new messages right now, without waiting for the next automatic poll cycle. Use when you expect a reply and want it immediately. If no sessionId is given, checks all sessions at once.",
       parameters: {
         type: "object",
         properties: {
-          sessionId: { type: "string", description: "Optional session ID or alias to poll; if omitted, all tracked sessions are polled" },
+          sessionId: { type: "string", description: "Session ID or alias to check. Omit to check all sessions at once. Use nexus_sessions to list available sessions." },
         },
         required: [],
       },
