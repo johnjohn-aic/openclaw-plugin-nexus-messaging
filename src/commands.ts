@@ -34,7 +34,7 @@ function formatHealth(health: ServiceHealth): string {
   for (const id of sessionIds) {
     const s = health.sessions[id];
     const alias = reverseAliasLookup(id);
-    const name = alias ?? id.slice(0, 8) + "…";
+    const name = alias ?? id;
     const stateIcon = s.state === "polling" ? "✅" : s.state === "backoff" ? "⚠️" : s.state === "joining" ? "⏳" : "⏹️";
     const parts: string[] = [];
     if (s.lastPollAt) {
