@@ -285,7 +285,19 @@ export function createRuntime(config: NexusMessagingConfig): Runtime {
           // nexus.sh persists agent-id at ~/.config/messaging/sessions/<sid>/agent
           // which is lost on container recreate (ephemeral filesystem).
           ensureLocalSessionState(sessionId, config.agentName);
-          return { sessionId, sessionKey: "" };
+          // Fetch current session state to recover expiresAt.
+          // Without this, tracker.expiresAt stays null and renewal
+          // only fires on the first tick (defensive, but delayed).
+          try {
+            const raw = await execCli(
+              ["status", sessionId, "--url", config.url],
+              sessionId
+            );
+            const st = parseJson<StatusResult>(raw, sessionId);
+            return { sessionId, sessionKey: "", expiresAt: st.expiresAt };
+          } catch {
+            return { sessionId, sessionKey: "" };
+          }
         }
         throw err;
       }

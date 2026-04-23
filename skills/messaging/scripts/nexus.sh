@@ -578,7 +578,9 @@ case "$CMD" in
         -d "$BODY"
     else
       http_request -X POST "$NEXUS_URL/v1/sessions/$SESSION_ID/renew" \
-        -H "X-Agent-Id: $AGENT_ID"
+        -H "X-Agent-Id: $AGENT_ID" \
+        -H "Content-Type: application/json" \
+        -d "{}"
     fi
     emit_response
 

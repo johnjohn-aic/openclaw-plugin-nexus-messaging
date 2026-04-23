@@ -200,14 +200,16 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
     }
 
     // Renewal pass — renew sessions approaching expiry BEFORE polling
+    // Also renew when expiresAt is unknown (null) — e.g. after plugin restart
+    // where join returned agent_id_taken without expiresAt.
     const now = Date.now();
     for (const sid of eligible) {
       const tracker = trackers.get(sid);
       if (
         tracker &&
-        tracker.expiresAt !== null &&
         tracker.state !== "backoff" &&
-        now + config.pollIntervalMs * 2 >= tracker.expiresAt.getTime()
+        (tracker.expiresAt === null ||
+         now + config.pollIntervalMs * 2 >= tracker.expiresAt.getTime())
       ) {
         try {
           const renewResult = await config.runtime.renew(sid);
@@ -218,7 +220,13 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
             `[nexus-messaging] Renewal failed for session ${sid} (will still attempt poll):`,
             renewErr
           );
-          // Do NOT increment errors or enter backoff — poll will detect actual death
+          // Do NOT increment errors or enter backoff — poll will detect actual death.
+          // When expiresAt is unknown (null), avoid retrying renew every tick —
+          // set a future sentinel so the renewal pass skips this session for a few
+          // cycles, giving poll time to detect the real session state.
+          if (tracker.expiresAt === null) {
+            tracker.expiresAt = new Date(now + config.pollIntervalMs * 4);
+          }
         }
       }
     }
