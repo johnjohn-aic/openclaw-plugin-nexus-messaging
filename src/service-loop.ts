@@ -4,6 +4,108 @@ import { tmpdir } from "node:os";
 import type { Runtime, RenewResult, Message } from "./runtime.js";
 import { RuntimeError } from "./runtime.js";
 
+export function computeRenewalThreshold(pollIntervalMs: number): number {
+  return Math.max(pollIntervalMs * 3, 120_000);
+}
+
+export function isTerminalRenewError(err: unknown): boolean {
+  if (err instanceof RuntimeError) {
+    return err.code === "session-expired" || err.code === "agent-not-in-session";
+  }
+  return false;
+}
+
+const MAX_SKIP_CYCLES = 6;
+
+export interface SessionTracker {
+  cursor: string | undefined;
+  consecutiveErrors: number;
+  lastPollAt: string | null;
+  state: SessionPollState;
+  skipUntilCycle: number;
+  expiresAt: Date | null;
+  ttl: number | null;
+}
+
+/** Outcome of attemptRenewal: indicates what happened and what the caller should do next. */
+export interface RenewalOutcome {
+  renewed: boolean;
+  attempted: boolean;
+  backoffReset: boolean;
+  sentinelSet: boolean;
+  lastError?: unknown;
+}
+
+/**
+ * Attempts to renew a session with retry logic. Mutates tracker on success (expiresAt, ttl, backoff reset)
+ * or on null+failure (writes sentinel). Returns outcome flags so caller knows if a warning should be emitted.
+ */
+export async function attemptRenewal(
+  runtime: Runtime,
+  sessionId: string,
+  tracker: SessionTracker,
+  now: number,
+  pollIntervalMs: number
+): Promise<RenewalOutcome> {
+  const threshold = computeRenewalThreshold(pollIntervalMs);
+  const needsRenewal = tracker.expiresAt === null || now + threshold >= tracker.expiresAt.getTime();
+
+  if (!needsRenewal) {
+    return { renewed: false, attempted: false, backoffReset: false, sentinelSet: false };
+  }
+
+  let renewSuccess = false;
+  let renewResult: RenewResult | undefined;
+  let lastError: unknown | undefined;
+
+  try {
+    renewResult = await runtime.renew(sessionId);
+    renewSuccess = true;
+  } catch (firstErr: unknown) {
+    lastError = firstErr;
+    if (!isTerminalRenewError(firstErr)) {
+      await new Promise(r => setTimeout(r, 300));
+      try {
+        renewResult = await runtime.renew(sessionId);
+        renewSuccess = true;
+        lastError = undefined;
+      } catch (retryErr: unknown) {
+        lastError = retryErr;
+      }
+    }
+  }
+
+  const wasBackoff = tracker.state === "backoff";
+
+  if (renewSuccess && renewResult) {
+    tracker.expiresAt = new Date(renewResult.expiresAt);
+    tracker.ttl = renewResult.ttl;
+    if (wasBackoff) {
+      tracker.consecutiveErrors = 0;
+      tracker.skipUntilCycle = 0;
+      tracker.state = "polling";
+    }
+    return {
+      renewed: true,
+      attempted: true,
+      backoffReset: wasBackoff,
+      sentinelSet: false,
+    };
+  }
+
+  const sentinelSet = tracker.expiresAt === null;
+  if (sentinelSet) {
+    tracker.expiresAt = new Date(now + pollIntervalMs * 4);
+  }
+  return {
+    renewed: false,
+    attempted: true,
+    backoffReset: false,
+    sentinelSet,
+    lastError,
+  };
+}
+
 function buildHealthFilePath(agentName?: string): string {
   const suffix = agentName ? `-${agentName.replace(/[^a-zA-Z0-9_-]/g, "_")}` : "";
   return resolve(tmpdir(), `nexus-messaging-health${suffix}.json`);
@@ -74,18 +176,6 @@ export interface ServiceLoop {
   addSession(sessionId: string): void;
   removeSession(sessionId: string): void;
   forcePoll(sessionId?: string): Promise<ForcePollResult>;
-}
-
-const MAX_SKIP_CYCLES = 6;
-
-interface SessionTracker {
-  cursor: string | undefined;
-  consecutiveErrors: number;
-  lastPollAt: string | null;
-  state: SessionPollState;
-  skipUntilCycle: number;
-  expiresAt: Date | null;
-  ttl: number | null;
 }
 
 function newTracker(): SessionTracker {
@@ -187,6 +277,25 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
 
     const cycle = currentCycle++;
 
+    // Renewal pass — scan ALL non-stopped/non-joining trackers regardless of skipUntilCycle.
+    // This ensures backoff sessions blocked by skipUntilCycle are still reached for renewal.
+    // When expiresAt is null, renewal is attempted as a self-healing path; on failure a
+    // sentinel is written to prevent a tight retry loop on every subsequent tick.
+    const now = Date.now();
+    for (const [sid, tracker] of trackers) {
+      if (tracker.state === "stopped" || tracker.state === "joining") continue;
+
+      const outcome = await attemptRenewal(config.runtime, sid, tracker, now, config.pollIntervalMs);
+      if (outcome.attempted && !outcome.renewed) {
+        console.warn(
+          `[nexus-messaging] Renewal failed for session ${sid} (will still attempt poll):`,
+          outcome.lastError
+        );
+      }
+    }
+
+    // Compute eligible list AFTER the renewal pass so sessions reset from backoff
+    // by a successful renew are included in the same tick's poll pass.
     const eligible: string[] = [];
     for (const [sessionId, tracker] of trackers) {
       if (tracker.skipUntilCycle <= cycle && tracker.state !== "stopped" && tracker.state !== "joining") {
@@ -197,38 +306,6 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
     if (eligible.length === 0) {
       persistHealth(healthFile, { state: loopState, sessions: buildSessionsSnapshot() });
       return;
-    }
-
-    // Renewal pass — renew sessions approaching expiry BEFORE polling
-    // Also renew when expiresAt is unknown (null) — e.g. after plugin restart
-    // where join returned agent_id_taken without expiresAt.
-    const now = Date.now();
-    for (const sid of eligible) {
-      const tracker = trackers.get(sid);
-      if (
-        tracker &&
-        tracker.state !== "backoff" &&
-        (tracker.expiresAt === null ||
-         now + config.pollIntervalMs * 2 >= tracker.expiresAt.getTime())
-      ) {
-        try {
-          const renewResult = await config.runtime.renew(sid);
-          tracker.expiresAt = new Date(renewResult.expiresAt);
-          tracker.ttl = renewResult.ttl;
-        } catch (renewErr: unknown) {
-          console.warn(
-            `[nexus-messaging] Renewal failed for session ${sid} (will still attempt poll):`,
-            renewErr
-          );
-          // Do NOT increment errors or enter backoff — poll will detect actual death.
-          // When expiresAt is unknown (null), avoid retrying renew every tick —
-          // set a future sentinel so the renewal pass skips this session for a few
-          // cycles, giving poll time to detect the real session state.
-          if (tracker.expiresAt === null) {
-            tracker.expiresAt = new Date(now + config.pollIntervalMs * 4);
-          }
-        }
-      }
     }
 
     const results = await Promise.allSettled(
