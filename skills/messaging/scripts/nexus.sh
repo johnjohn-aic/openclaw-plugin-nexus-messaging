@@ -466,13 +466,8 @@ case "$CMD" in
         fi
         # Conservative fallback: serialize the JSON payload into the text field
         echo "⚠️  Server does not support native json messages; payload serialized into text field." >&2
-        SERIALIZED=$(printf '%s' "$JSON_PAYLOAD" | jq -c .)
-        if [[ -n "$TEXT" ]]; then
-          TEXT="$TEXT $SERIALIZED"
-        else
-          TEXT="$SERIALIZED"
-        fi
-        BODY=$(printf '%s' "$TEXT" | jq -c '{text: .}')
+        BODY=$(printf '%s' "$JSON_PAYLOAD" | jq -c --arg text "$TEXT" \
+          '{text: (if $text == "" then (. | tostring) else ($text + " " + (. | tostring)) end)}')
       fi
     else
       # Plain text-only send
