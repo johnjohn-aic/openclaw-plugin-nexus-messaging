@@ -10,6 +10,7 @@ set -euo pipefail
 NEXUS_URL="${NEXUS_URL:-https://messaging.md}"
 NEXUS_DATA_DIR="${HOME}/.config/messaging/sessions"
 NEXUS_ALIASES_FILE="${HOME}/.config/messaging/aliases.json"
+NEXUS_CAPS_FILE="${HOME}/.config/messaging/server-caps.json"
 
 # Resolve alias → session ID (or pass through if not an alias)
 resolve_session() {
@@ -64,6 +65,43 @@ emit_response() {
   if [[ "$HTTP_OK" != "true" ]]; then
     exit 1
   fi
+}
+
+# Resolve the server's supported message formats, with a 5-minute disk cache.
+# stdout: space-separated list of supported formats (e.g. "text json").
+# On any cache miss / unreadable cache / health failure, returns "text" only
+# (conservative: assume the server does NOT support json).
+get_server_capability() {
+  local now fetched_at age formats health_resp
+  now=$(date +%s)
+
+  # 1. Use fresh disk cache (TTL 300s)
+  if [[ -f "$NEXUS_CAPS_FILE" ]]; then
+    fetched_at=$(jq -r '.fetchedAt // empty' "$NEXUS_CAPS_FILE" 2>/dev/null || true)
+    if [[ "$fetched_at" =~ ^[0-9]+$ ]]; then
+      age=$(( now - fetched_at ))
+      if (( age < 300 )); then
+        jq -r '(.capabilities.messageFormat // []) | join(" ")' "$NEXUS_CAPS_FILE" 2>/dev/null || true
+        return 0
+      fi
+    fi
+  fi
+
+  # 2. Cache miss or stale — query the health endpoint
+  health_resp=$(curl -s --max-time 5 "$NEXUS_URL/health" 2>/dev/null || true)
+  formats=$(jq -r '(.capabilities.messageFormat // []) | join(" ")' <<<"$health_resp" 2>/dev/null || true)
+
+  if [[ -n "$formats" ]]; then
+    # 3. Persist the capabilities object with a fetchedAt timestamp
+    mkdir -p "$(dirname "$NEXUS_CAPS_FILE")"
+    jq -c --argjson now "$now" '{capabilities, fetchedAt: $now}' <<<"$health_resp" > "$NEXUS_CAPS_FILE" 2>/dev/null || true
+    printf '%s\n' "$formats"
+    return 0
+  fi
+
+  # 4. Conservative fallback: assume the server does not support json
+  printf 'text\n'
+  return 0
 }
 AGENT_ID=""
 TTL=""
@@ -362,9 +400,40 @@ case "$CMD" in
     ;;
 
   send)
-    SESSION_ID="${1:?Usage: nexus.sh send <SESSION_ID> \"text\" [--agent-id ID]}"
+    SESSION_ID="${1:?Usage: nexus.sh send <SESSION_ID> \"text\" [--json PAYLOAD] [--strict]}"
     SESSION_ID=$(resolve_session "$SESSION_ID")
-    TEXT="${2:?Usage: nexus.sh send <SESSION_ID> \"text\" [--agent-id ID]}"
+    shift || true
+
+    TEXT=""
+    JSON_PAYLOAD=""
+    STRICT=""
+
+    # Parse send-specific args (--json/--strict parsed here, NOT in the global
+    # parser, so that other commands like `ls --json` keep working).
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --json)
+          if [[ $# -lt 2 || -z "${2:-}" ]]; then
+            echo '{"error":"--json requires a value (JSON payload)"}' >&2
+            exit 1
+          fi
+          JSON_PAYLOAD="$2"; shift 2 ;;
+        --strict) STRICT="true"; shift ;;
+        *)
+          if [[ -z "$TEXT" ]]; then
+            TEXT="$1"
+          else
+            TEXT="$TEXT $1"
+          fi
+          shift ;;
+      esac
+    done
+
+    # At least one of text or --json is required
+    if [[ -z "$TEXT" && -z "$JSON_PAYLOAD" ]]; then
+      echo '{"error":"at least one of text or --json must be provided"}' >&2
+      exit 1
+    fi
 
     if [[ -z "$AGENT_ID" ]]; then
       mkdir -p "$NEXUS_DATA_DIR/$SESSION_ID"
@@ -376,7 +445,39 @@ case "$CMD" in
       fi
     fi
 
-    JSON_TEXT=$(printf '%s' "$TEXT" | jq -Rs .)
+    # Build the request body
+    if [[ -n "$JSON_PAYLOAD" ]]; then
+      # Validate the --json payload is valid JSON
+      if ! printf '%s' "$JSON_PAYLOAD" | jq -e . >/dev/null 2>&1; then
+        echo '{"error":"invalid JSON in --json payload"}' >&2
+        exit 1
+      fi
+
+      FORMATS=$(get_server_capability)
+      if [[ " $FORMATS " == *" json "* ]]; then
+        # Server supports native json: { text?, json }
+        BODY=$(printf '%s' "$JSON_PAYLOAD" | jq -c --arg text "$TEXT" \
+          '{json: .} + (if $text == "" then {} else {text: $text} end)')
+      else
+        # Server lacks json support
+        if [[ "$STRICT" == "true" ]]; then
+          echo "✖  Server does not support json messages. Use without --strict to fall back to text, or omit --json." >&2
+          exit 1
+        fi
+        # Conservative fallback: serialize the JSON payload into the text field
+        echo "⚠️  Server does not support native json messages; payload serialized into text field." >&2
+        SERIALIZED=$(printf '%s' "$JSON_PAYLOAD" | jq -c .)
+        if [[ -n "$TEXT" ]]; then
+          TEXT="$TEXT $SERIALIZED"
+        else
+          TEXT="$SERIALIZED"
+        fi
+        BODY=$(printf '%s' "$TEXT" | jq -c '{text: .}')
+      fi
+    else
+      # Plain text-only send
+      BODY=$(printf '%s' "$TEXT" | jq -c '{text: .}')
+    fi
 
     KEY_FILE="$NEXUS_DATA_DIR/$SESSION_ID/key"
     if [[ -f "$KEY_FILE" ]]; then
@@ -384,12 +485,12 @@ case "$CMD" in
         -H "X-Agent-Id: $AGENT_ID" \
         -H "X-Session-Key: $(cat "$KEY_FILE")" \
         -H "Content-Type: application/json" \
-        -d "{\"text\": $JSON_TEXT}"
+        -d "$BODY"
     else
       http_request -X POST "$NEXUS_URL/v1/sessions/$SESSION_ID/messages" \
         -H "X-Agent-Id: $AGENT_ID" \
         -H "Content-Type: application/json" \
-        -d "{\"text\": $JSON_TEXT}"
+        -d "$BODY"
     fi
     emit_response
     ;;
@@ -452,6 +553,10 @@ case "$CMD" in
       echo "💬 Received $MESSAGE_COUNT message(s)" >&2
       echo "Tip: Send a message:" >&2
       echo "$0 send $SESSION_ID \"Your message\"" >&2
+    fi
+    JSON_MSG_COUNT=$(echo "$RESPONSE" | jq '[.messages[] | select(has("json"))] | length' 2>/dev/null || echo 0)
+    if [[ "$JSON_MSG_COUNT" -gt 0 ]]; then
+      echo "📦 $JSON_MSG_COUNT message(s) include structured json data" >&2
     fi
     if [[ "$MEMBERS" == "true" ]]; then
       MEMBER_COUNT=$(echo "$RESPONSE" | jq -r '.members | length // 0')
@@ -710,7 +815,8 @@ Commands:
   pair <SESSION>                          Generate pairing code
   claim <CODE> --agent-id ID             Claim pairing code (saves agent-id + session key)
   pair-status <CODE>                      Check pairing code state
-  send <SESSION> "text" [--agent-id]      Send message (uses saved agent-id + session key)
+  send <SESSION> "text" [--json PAYLOAD] [--strict] [--agent-id]
+                        Send message (text and/or structured json; at least one required)
   poll <SESSION> [--after] [--members]    Poll messages (cursor auto-managed)
   renew <SESSION> [--ttl N]              Renew session TTL
   poll-daemon <SESSION> [--interval N]    Poll with TTL tracking
@@ -725,6 +831,8 @@ Options:
   --creator-agent-id  Auto-join as creator (immune to inactivity)
   --after CURSOR      Poll after this cursor (default: auto)
   --members           Include member list in poll response
+  --json PAYLOAD      Send a structured JSON payload (send only; at least text or --json required)
+  --strict            Fail if server lacks native json support (send only)
   --interval N        Polling interval in seconds
 
 Tip: Use aliases to manage multiple sessions with short names.

@@ -41,6 +41,7 @@ export interface Message {
   id: string;
   agentId: string;
   text: string;
+  json?: unknown;
   cursor: string;
   expiresAt?: string;
   verified?: boolean;
@@ -90,7 +91,7 @@ export interface Runtime {
   join(sessionId: string): Promise<JoinResult>;
   poll(sessionId: string, after?: string): Promise<PollResult>;
   pollMembers(sessionId: string): Promise<PollResult>;
-  send(sessionId: string, text: string): Promise<SendResult>;
+  send(sessionId: string, text: string, opts?: { json?: unknown; strict?: boolean }): Promise<SendResult>;
   leave(sessionId: string): Promise<LeaveResult>;
   status(sessionId: string): Promise<StatusResult>;
   renew(sessionId: string, ttl?: number): Promise<RenewResult>;
@@ -318,11 +319,15 @@ export function createRuntime(config: NexusMessagingConfig): Runtime {
       return parseJson<PollResult>(raw, sessionId);
     },
 
-    async send(sessionId: string, text: string): Promise<SendResult> {
-      const raw = await execCli(
-        ["send", sessionId, text, "--url", config.url],
-        sessionId
-      );
+    async send(sessionId: string, text: string, opts?: { json?: unknown; strict?: boolean }): Promise<SendResult> {
+      const args = ["send", sessionId, text, "--url", config.url];
+      if (opts?.json !== undefined) {
+        args.push("--json", JSON.stringify(opts.json));
+      }
+      if (opts?.strict) {
+        args.push("--strict");
+      }
+      const raw = await execCli(args, sessionId);
       return parseJson<SendResult>(raw, sessionId);
     },
 

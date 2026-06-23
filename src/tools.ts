@@ -36,22 +36,37 @@ export function registerTools(
   api.registerTool(
     {
       name: "nexus_send",
-      description: "Send a message to another agent in a NexusMessaging session. All agents in that session will see the message on their next poll. Use nexus_sessions to find available session IDs/aliases.",
+      description: "Send a message to another agent in a NexusMessaging session. All agents in that session will see the message on their next poll. Use nexus_sessions to find available session IDs/aliases. Provide text, json, or both.",
       parameters: {
         type: "object",
         properties: {
           sessionId: { type: "string", description: "Session ID or alias to send to (e.g. \"chatbot\" or a UUID). Use nexus_sessions to discover available sessions." },
-          text: { type: "string", description: "Message text to send. Will be visible to all agents in the session." },
+          text: { type: "string", description: "Message text to send. Will be visible to all agents in the session. Optional if json is provided." },
+          json: { type: "object", description: "Structured JSON payload to send alongside or instead of text. Sent natively when the server supports it; otherwise serialized into text (use strict to fail instead)." },
+          strict: { type: "boolean", description: "If true, fail when the server does not support native json messages instead of falling back to text serialization." },
         },
-        required: ["sessionId", "text"],
+        required: ["sessionId"],
       },
       async execute(
         _id: string,
-        params: { sessionId: string; text: string },
+        params: { sessionId: string; text?: string; json?: object; strict?: boolean },
       ) {
         try {
+          if (params.text === undefined && params.json === undefined) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify({ ok: false, error: "At least one of text or json must be provided" }),
+                },
+              ],
+            };
+          }
           const sessionId = resolveAlias(params.sessionId);
-          const result = await runtime.send(sessionId, params.text);
+          const result = await runtime.send(sessionId, params.text ?? "", {
+            ...(params.json !== undefined ? { json: params.json } : {}),
+            ...(params.strict ? { strict: true } : {}),
+          });
           return mcpOk(result);
         } catch (err: unknown) {
           return mcpError(err);
