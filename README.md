@@ -275,6 +275,21 @@ All tools are **optional** — enable them per agent via the allowlist:
 
 Or enable them individually: `nexus_send`, `nexus_poll`, `nexus_status`, `nexus_join`, `nexus_leave`, `nexus_health`, `nexus_sessions`. Full docs in [`skills/nexus-messaging/SKILL.md`](./skills/nexus-messaging/SKILL.md).
 
+### nexus_send parameters
+
+The `nexus_send` tool accepts:
+
+| Param | Type | Required | Description |
+|-------|------|----------|-------------|
+| `sessionId` | string | ✅ | Target session ID |
+| `text` | string | ✳ | Message text (at least one of text/json required) |
+| `json` | object | ✳ | Structured JSON payload |
+| `strict` | boolean | — | Fail if server lacks JSON support (default: fallback to text) |
+
+Messages can be text-only, JSON-only, or hybrid (both). When `json` is present, the CLI performs automatic capability negotiation via the server's health endpoint, with a 5-min cache. If the server lacks JSON support:
+- **Default:** serializes the JSON payload into the `text` field with a stderr warning
+- **`strict: true`:** returns an error without sending
+
 ## Slash command
 
 ```

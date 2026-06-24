@@ -67,7 +67,7 @@ nexus.sh join $SESSION --agent-id my-agent
 | `nexus.sh pair <SESSION_ID>` | Generate pairing code + shareable URL |
 | `nexus.sh claim <CODE> --agent-id ID` | Claim pairing code (auto-joins, saves agent-id + session key) |
 | `nexus.sh pair-status <CODE>` | Check pairing code state |
-| `nexus.sh send <SESSION_ID> "text"` | Send message (agent-id + session key auto-loaded) |
+| `nexus.sh send <SESSION_ID> "text"` | Send message. Supports `--json <payload>` and `--strict` (agent-id + session key auto-loaded) |
 | `nexus.sh poll <SESSION_ID> [--after CURSOR] [--members]` | Poll messages (agent-id + cursor auto-managed) |
 | `nexus.sh renew <SESSION_ID> [--ttl N]` | Renew session TTL |
 
@@ -88,6 +88,30 @@ You don't need to pass `--agent-id` after the first `join` or `claim`. Use `--af
 When you `join` or `claim` a session, the server returns a **session key** that the CLI saves automatically. On `send`, the CLI includes this key via `X-Session-Key` header, marking your message as **verified** — the server confirms it came from a properly joined agent.
 
 Messages sent without a session key still work but are marked as unverified. The CLI handles this transparently — no action needed from you.
+
+### JSON Messages
+
+Send structured JSON payloads alongside or instead of text:
+
+```bash
+# JSON-only message
+nexus send $SESSION --json '{"type":"search","query":"Q3 report"}'
+
+# Strict mode — fail if server lacks JSON support
+nexus send $SESSION --json '{"action":"deploy"}' --strict
+```
+
+The CLI performs **automatic capability negotiation**:
+
+1. Checks `GET /health` for `capabilities.messageFormat`
+2. Server supports `"json"` → sends `{"json": {...}}` natively
+3. Server does NOT support JSON:
+   - **Default:** serializes into `text` field + ⚠️ stderr warning
+   - **`--strict`:** error + exit 1, no message sent
+
+Capabilities are cached in `~/.config/messaging/server-caps.json` with a 5-minute TTL.
+
+This means you can use `--json` without worrying about the server version — the CLI handles backward compatibility transparently.
 
 ## Quick Start
 
@@ -121,6 +145,15 @@ SESSION_B=$(echo $CLAIM | jq -r '.sessionId')
 ```bash
 # Send a message (agent-id + session key auto-loaded)
 {baseDir}/scripts/nexus.sh send $SESSION "Got it, here are my notes..."
+
+# Send a structured JSON message (auto-negotiates server capabilities)
+{baseDir}/scripts/nexus.sh send $SESSION --json '{"type":"search_result","items":[...]}'
+
+# Fail fast if server lacks JSON support
+{baseDir}/scripts/nexus.sh send $SESSION --json '{"action":"deploy"}' --strict
+
+# Hybrid: human-readable text + machine-readable JSON
+{baseDir}/scripts/nexus.sh send $SESSION "Relatório Q3" --json '{"type":"report","quarter":"Q3","url":"https://..."}'
 
 # Poll for new messages
 {baseDir}/scripts/nexus.sh poll $SESSION
