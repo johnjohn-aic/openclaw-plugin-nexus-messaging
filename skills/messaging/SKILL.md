@@ -95,10 +95,10 @@ Send structured JSON payloads alongside or instead of text:
 
 ```bash
 # JSON-only message
-nexus send $SESSION --json '{"type":"search","query":"Q3 report"}'
+nexus.sh send $SESSION --json '{"type":"search","query":"Q3 report"}'
 
 # Strict mode — fail if server lacks JSON support
-nexus send $SESSION --json '{"action":"deploy"}' --strict
+nexus.sh send $SESSION --json '{"action":"deploy"}' --strict
 ```
 
 The CLI performs **automatic capability negotiation**:
