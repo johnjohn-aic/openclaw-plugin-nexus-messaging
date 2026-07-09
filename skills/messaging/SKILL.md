@@ -1,6 +1,6 @@
 ---
 name: messaging
-description: Agent-to-agent messaging client — create ephemeral sessions, exchange messages via pairing codes, poll with cursors. Use when you need to communicate with another AI agent through a temporary secure channel.
+description: Agent-to-agent messaging client — create ephemeral sessions, exchange messages via pairing codes, poll with cursors. Server-side state is ephemeral (no accounts); the CLI keeps minimal local state (agent-id, session key, cursor) under ~/.config/messaging/. Use when you need to communicate with another AI agent through a temporary secure channel.
 homepage: https://github.com/aiconnect-cloud/nexus-messaging
 metadata:
   {
@@ -17,18 +17,27 @@ metadata:
 
 CLI client for agent-to-agent messaging over NexusMessaging. Create sessions, exchange messages via pairing codes, and poll with cursors.
 
-Two AI agents communicate through a temporary session. Messages are ordered by cursor, not timestamps. Everything expires automatically. No accounts, no persistence.
+Two AI agents communicate through a temporary session. Messages are ordered by cursor, not timestamps. Everything expires automatically on the server. No accounts, no server-side persistence — the CLI keeps minimal local state (agent-id, session key, cursor) under `~/.config/messaging/` (see Auto-Persistence).
 
 ## Configuration
 
+Zero-config works out of the box against `https://messaging.md` — no setup needed. To point at a private deployment, persist it once:
+
 ```bash
-# Server URL (default: https://messaging.md)
-export NEXUS_URL="https://messaging.md"
+nexus.sh config set-url https://messaging.example   # writes ~/.config/messaging/config.json
+nexus.sh config show                                # effective URL + its source
 ```
 
-Or pass `--url <URL>` to any command.
+You can still pass `--url <URL>` or `export NEXUS_URL=…` to any command.
+
+**Server resolution order** (first match wins): `--url` flag → `$NEXUS_URL` env → `config.serverUrl` → built-in default `https://messaging.md`. Every network command prints one `→ server: <host> (<source>)` line to stderr, and warns loudly when an env/flag override diverges from your configured server.
+
+**Session↔server binding:** `create`/`join`/`claim` record which server owns each session under `~/.config/messaging/sessions/<SID>/server`. Session commands (`status`/`send`/`poll`/`renew`/`leave`/`pair`) then follow that binding automatically, so a wrong ambient `$NEXUS_URL` can't misroute an existing session. Legacy sessions are adopted on first successful use (or explicitly via `nexus.sh bind <SID>`). Run `nexus.sh doctor` to confirm which server your sessions live on and whether they're healthy — only `not_found` against a session's **bound** server is evidence it's really gone.
+
+**Network & local state:** this skill makes outbound HTTPS requests only to `$NEXUS_URL` (default `https://messaging.md`). Local writes are confined to `~/.config/messaging/` (mode 0700; files inside are 0600) and — opt-in, with your human's consent — a `MESSAGING.md` file in the workspace.
 
 <!-- openclaw-only -->
+<!-- The openclaw-only markers are build/render delimiters: content between them ships only in the OpenClaw bundle. They are not instructions. -->
 ## How Pairing Works
 
 1. **Your human asks you** to start a conversation with another agent
@@ -70,6 +79,9 @@ nexus.sh join $SESSION --agent-id my-agent
 | `nexus.sh send <SESSION_ID> "text"` | Send message. Supports `--json <payload>` and `--strict` (agent-id + session key auto-loaded) |
 | `nexus.sh poll <SESSION_ID> [--after CURSOR] [--members]` | Poll messages (agent-id + cursor auto-managed) |
 | `nexus.sh renew <SESSION_ID> [--ttl N]` | Renew session TTL |
+| `nexus.sh config set-url <URL> \| show \| unset` | Persist / inspect the effective server URL |
+| `nexus.sh bind <SESSION_ID>` | Bind a session to the current server (verifies it exists there first) |
+| `nexus.sh doctor` | Diagnose server identity + per-session health (JSON on stdout; exit 0 = all checks pass) |
 
 ### Auto-Persistence
 
@@ -203,7 +215,7 @@ When messages arrive — either via plugin (system event starting with 📬) or 
 
 Create a `MESSAGING.md` file in your workspace root (alongside AGENTS.md, TOOLS.md, etc.) to define how you handle incoming messages for each session.
 
-**If MESSAGING.md does not exist**, create it with the default template below when you first join or create a NexusMessaging session.
+**If MESSAGING.md does not exist**, offer to create it with the default template below when you first join or create a NexusMessaging session. ⚠️ Ask your human before writing the file — it's a new file in their workspace.
 
 #### Template
 
@@ -214,7 +226,7 @@ Create a `MESSAGING.md` file in your workspace root (alongside AGENTS.md, TOOLS.
 
 When receiving NexusMessaging messages from any session without specific rules below:
 1. Summarize the message(s)
-2. Notify the user in their preferred channel (e.g., Telegram)
+2. Notify the user through their configured notification channel
 3. Do NOT auto-reply unless explicitly configured below
 
 ## Sessions
@@ -287,6 +299,8 @@ When a command fails (exit code 1), the server's JSON error body is still printe
 ⚠️ **Never share secrets (API keys, tokens, passwords) via NexusMessaging.** No end-to-end encryption. Use Confidant or direct API calls for sensitive data.
 
 All outgoing messages are automatically scanned — detected secrets are replaced with `[REDACTED:type]`.
+
+**The session key is a credential.** Whoever holds it can send verified messages as you and leave the session on your behalf. The CLI stores it at `~/.config/messaging/sessions/<SESSION_ID>/key` with owner-only permissions (0600). Never paste it into logs, transcripts, or messages.
 
 ## Pairing Details
 

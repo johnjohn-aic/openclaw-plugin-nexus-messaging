@@ -43,8 +43,12 @@ LS_JSON=$("$NEXUS_SH" ls --json --url "$NEXUS_URL" 2>/dev/null || echo '{"sessio
 SESSION_COUNT=$(echo "$LS_JSON" | jq '.sessions | length')
 
 RESULTS="[]"
+# Count by the honest ls status vocabulary — never collapse everything non-active
+# into "expired" (unreachable ≠ dead: a transient blip must not read as expired).
 ACTIVE=0
-EXPIRED=0
+UNREACHABLE=0
+NOT_FOUND=0
+ERRORED=0
 
 for i in $(seq 0 $((SESSION_COUNT - 1))); do
   SID=$(echo "$LS_JSON" | jq -r ".sessions[$i].sessionId")
@@ -80,7 +84,11 @@ for i in $(seq 0 $((SESSION_COUNT - 1))); do
     POLL_RESP=$("$NEXUS_SH" poll "$SID" --after 999999999 --members --url "$NEXUS_URL" 2>/dev/null || echo '{}')
     MEMBERS=$(echo "$POLL_RESP" | jq -c '.members // []')
   else
-    EXPIRED=$((EXPIRED + 1))
+    case "$STATUS" in
+      unreachable) UNREACHABLE=$((UNREACHABLE + 1)) ;;  # possibly alive — transient/network
+      not_found)   NOT_FOUND=$((NOT_FOUND + 1)) ;;      # server disowned it (404)
+      *)           ERRORED=$((ERRORED + 1)) ;;          # 5xx/other server problem
+    esac
   fi
 
   # Health from plugin file
@@ -113,14 +121,16 @@ done
 jq -nc \
   --arg pluginState "$PLUGIN_STATE" \
   --argjson active "$ACTIVE" \
-  --argjson expired "$EXPIRED" \
+  --argjson unreachable "$UNREACHABLE" \
+  --argjson notFound "$NOT_FOUND" \
+  --argjson errored "$ERRORED" \
   --argjson sessions "$RESULTS" \
-  '{pluginState: $pluginState, activeSessions: $active, expiredSessions: $expired, sessions: $sessions}'
+  '{pluginState: $pluginState, activeSessions: $active, unreachableSessions: $unreachable, notFoundSessions: $notFound, erroredSessions: $errored, sessions: $sessions}'
 
 # --- Human-readable table ---
 echo "" >&2
 echo "🔌 Plugin: $PLUGIN_STATE" >&2
-echo "📡 Sessions: $ACTIVE active, $EXPIRED expired" >&2
+echo "📡 Sessions: $ACTIVE active, $UNREACHABLE unreachable, $NOT_FOUND not_found, $ERRORED error" >&2
 echo "" >&2
 
 if [[ "$SESSION_COUNT" -gt 0 ]]; then

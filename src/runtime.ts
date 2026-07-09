@@ -97,17 +97,42 @@ export interface Runtime {
   renew(sessionId: string, ttl?: number): Promise<RenewResult>;
 }
 
-function classifyError(
+// Known server error identifiers (JSON `error` field) → RuntimeError code.
+// Single extension point: add a new identifier here (and a spec scenario) to
+// make it drive recovery. Unknown identifiers fall through to the heuristics.
+const SERVER_ERROR_CODES: Record<string, RuntimeErrorCode> = {
+  agent_not_in_session: "agent-not-in-session",
+  session_not_found: "session-expired",
+};
+
+export function classifyError(
   stderr: string,
   stdout: string,
   sessionId?: string
 ): RuntimeError {
   const combined = `${stderr} ${stdout}`;
+
+  // Structured-first: stdout is JSON-only by nexus.sh contract. A known
+  // `error` identifier is authoritative and maps deterministically.
+  try {
+    const parsed = JSON.parse(stdout.trim());
+    if (parsed && typeof parsed.error === "string") {
+      const code = SERVER_ERROR_CODES[parsed.error];
+      if (code) {
+        return new RuntimeError(code, combined, { sessionId, cliOutput: stdout });
+      }
+    }
+  } catch {
+    // Not JSON (transport failure, partial output) → fall through to heuristics.
+  }
+
   const lower = combined.toLowerCase();
 
   if (
     lower.includes("agent") &&
-    (lower.includes("not in session") || lower.includes("not found"))
+    (lower.includes("not in session") ||
+      lower.includes("not_in_session") ||
+      lower.includes("not found"))
   ) {
     return new RuntimeError("agent-not-in-session", combined, {
       sessionId,

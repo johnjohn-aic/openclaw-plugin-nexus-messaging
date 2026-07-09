@@ -1,16 +1,136 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Session keys are credentials — keep everything we write owner-only
+umask 077
+# Tighten state written before umask existed (echo > preserves the old mode)
+[[ -d "$HOME/.config/messaging" ]] && chmod -R go-rwx "$HOME/.config/messaging" 2>/dev/null || true
+
 # NexusMessaging CLI wrapper
 # Usage: nexus.sh <command> [args] [--url URL] [--agent-id ID] [--ttl N] [--after CURSOR] [--members]
 #
 # stdout: JSON only (pipeable to jq)
 # stderr: human-readable tips, status messages
 
-NEXUS_URL="${NEXUS_URL:-https://messaging.md}"
+NEXUS_URL_ENV="${NEXUS_URL:-}"            # raw env before any default (lets us name the source)
+NEXUS_DEFAULT_URL="https://messaging.md"
+NEXUS_URL=""                              # effective URL — set by resolve_server_url after arg parse
+SERVER_SOURCE=""                          # --url | env NEXUS_URL | config | default | session binding
+URL_FLAG=""                               # value of --url, if given
 NEXUS_DATA_DIR="${HOME}/.config/messaging/sessions"
 NEXUS_ALIASES_FILE="${HOME}/.config/messaging/aliases.json"
 NEXUS_CAPS_FILE="${HOME}/.config/messaging/server-caps.json"
+NEXUS_CONFIG_FILE="${HOME}/.config/messaging/config.json"
+
+# Normalize a server URL for storage + comparison: lowercase scheme + host[:port],
+# strip a trailing slash. ponytail: no default-port folding (:80/:443) — base URLs
+# never carry it; add it here if a divergence check ever proves too literal.
+normalize_url() {
+  local url="${1%/}"
+  if [[ "$url" != *"://"* ]]; then
+    # Scheme-less input (e.g. "messaging.md"): lowercase the authority, keep any
+    # path, and leave the scheme for curl to default — matches the pre-config
+    # behavior instead of fabricating a bogus "host://host".
+    local a0="${url%%/*}" p0=""
+    [[ "$url" == */* ]] && p0="/${url#*/}"
+    printf '%s%s\n' "$(printf '%s' "$a0" | tr '[:upper:]' '[:lower:]')" "$p0"
+    return 0
+  fi
+  local scheme="${url%%://*}" rest="${url#*://}" path=""
+  [[ "$rest" == */* ]] && path="/${rest#*/}"
+  local authority="${rest%%/*}"
+  scheme=$(printf '%s' "$scheme" | tr '[:upper:]' '[:lower:]')
+  authority=$(printf '%s' "$authority" | tr '[:upper:]' '[:lower:]')
+  printf '%s://%s%s\n' "$scheme" "$authority" "$path"
+}
+
+# Resolve the effective server URL + its source. Precedence: --url > NEXUS_URL env >
+# config.serverUrl > built-in default. Every call always resolves a server; the
+# absence of config is never an error (zero-config install-and-go is preserved).
+resolve_server_url() {
+  if [[ -n "$URL_FLAG" ]]; then
+    NEXUS_URL=$(normalize_url "$URL_FLAG"); SERVER_SOURCE="--url"
+  elif [[ -n "$NEXUS_URL_ENV" ]]; then
+    NEXUS_URL=$(normalize_url "$NEXUS_URL_ENV"); SERVER_SOURCE="env NEXUS_URL"
+  else
+    local cfg=""
+    [[ -f "$NEXUS_CONFIG_FILE" ]] && cfg=$(jq -r '.serverUrl // empty' "$NEXUS_CONFIG_FILE" 2>/dev/null || true)
+    if [[ -n "$cfg" ]]; then
+      NEXUS_URL=$(normalize_url "$cfg"); SERVER_SOURCE="config"
+    else
+      NEXUS_URL="$NEXUS_DEFAULT_URL"; SERVER_SOURCE="default"
+    fi
+  fi
+}
+
+# One provenance line to stderr — which server, and why. stdout stays JSON-only.
+provenance_line() {
+  local host="${NEXUS_URL#*://}"; host="${host%%/*}"
+  echo "→ server: $host ($SERVER_SOURCE)" >&2
+}
+
+# Loud warning when a configured server is being overridden by --url/env (and only then).
+divergence_warning() {
+  [[ "$SERVER_SOURCE" == "--url" || "$SERVER_SOURCE" == "env NEXUS_URL" ]] || return 0
+  [[ -f "$NEXUS_CONFIG_FILE" ]] || return 0
+  local cfg
+  cfg=$(jq -r '.serverUrl // empty' "$NEXUS_CONFIG_FILE" 2>/dev/null || true)
+  [[ -n "$cfg" ]] || return 0
+  cfg=$(normalize_url "$cfg")
+  if [[ "$NEXUS_URL" != "$cfg" ]]; then
+    echo "⚠️  server override: using $NEXUS_URL ($SERVER_SOURCE) — configured server is $cfg" >&2
+  fi
+}
+
+# Provenance + divergence, once, before the first network request of a command.
+net_preamble() {
+  divergence_warning
+  provenance_line
+}
+
+# Route a session-scoped command to the session's bound server (self-healing): a
+# 48-hex SID lives on exactly one server, so following the binding can only turn a
+# wrong-server miss into a right-server hit. Never fails — warnings only.
+route_session_server() {
+  local sid="$1"
+  local f="$NEXUS_DATA_DIR/$sid/server" bound=""
+  [[ -f "$f" ]] && bound=$(normalize_url "$(cat "$f")")
+  if [[ -n "$URL_FLAG" ]]; then
+    if [[ -n "$bound" && "$NEXUS_URL" != "$bound" ]]; then
+      echo "⚠️  session ${sid:0:12}… is bound to $bound — using $NEXUS_URL (--url overrides the binding)" >&2
+    fi
+    return 0
+  fi
+  if [[ -n "$bound" ]]; then
+    if [[ "$bound" != "$NEXUS_URL" ]]; then
+      if [[ "$SERVER_SOURCE" == "default" ]]; then
+        echo "ℹ️  using session's bound server $bound (ambient would have used $NEXUS_URL via default)" >&2
+      else
+        echo "⚠️  session ${sid:0:12}… is bound to $bound — overriding $NEXUS_URL ($SERVER_SOURCE)" >&2
+      fi
+    fi
+    NEXUS_URL="$bound"; SERVER_SOURCE="session binding"
+  fi
+  return 0
+}
+
+# TOFU: adopt the effective server as the binding after a successful (2xx) call.
+# Only ever reached post-success (emit_response exits 1 first on failure).
+adopt_binding_if_unbound() {
+  local sid="$1"
+  local f="$NEXUS_DATA_DIR/$sid/server"
+  [[ -d "$NEXUS_DATA_DIR/$sid" ]] || return 0
+  [[ -f "$f" ]] && return 0
+  echo "$NEXUS_URL" > "$f"
+  echo "ℹ️  adopted binding: ${sid:0:12}… → $NEXUS_URL (first successful use)" >&2
+}
+
+# Record the session→server binding on acquisition (create/join/claim).
+write_binding() {
+  local sid="$1"
+  mkdir -p "$NEXUS_DATA_DIR/$sid"
+  echo "$NEXUS_URL" > "$NEXUS_DATA_DIR/$sid/server"
+}
 
 # Resolve alias → session ID (or pass through if not an alias)
 resolve_session() {
@@ -46,12 +166,31 @@ remove_alias() {
   fi
 }
 
+# Clean up local leave state: remove data dir + any alias for a session.
+# Called only when the server confirms we're no longer a member.
+cleanup_leave_state() {
+  local sid="$1" alias_name="$2"
+  rm -rf "$NEXUS_DATA_DIR/$sid"
+  if [[ -n "$alias_name" ]]; then
+    remove_alias "$alias_name"
+  else
+    local found
+    found=$(reverse_alias "$sid")
+    if [[ -n "$found" ]]; then
+      remove_alias "$found"
+    fi
+  fi
+}
+
 # HTTP request helper: preserves error body on failure
 # Usage: http_request [curl args...]
 # Sets RESPONSE and HTTP_OK (true/false)
 http_request() {
   local exit_code=0
-  RESPONSE=$(curl -s --fail-with-body "$@") || exit_code=$?
+  # Bound every request: poll is not long-poll (server returns immediately), so
+  # no legit call holds the connection open. Prevents poll-all from hanging on a
+  # wedged server once it started polling unreachable sessions. Tunable for slow nets.
+  RESPONSE=$(curl -s --fail-with-body --max-time "${NEXUS_HTTP_TIMEOUT:-10}" "$@") || exit_code=$?
   if [[ $exit_code -ne 0 ]]; then
     HTTP_OK=false
   else
@@ -59,10 +198,23 @@ http_request() {
   fi
 }
 
-# Emit RESPONSE to stdout; if HTTP failed, also exit 1
+# Emit RESPONSE to stdout; if HTTP failed, also exit 1.
+# When RESPONSE is not valid JSON (transport failure / proxy HTML),
+# emit a synthetic JSON error to stdout instead of raw output.
 emit_response() {
-  echo "$RESPONSE"
-  if [[ "$HTTP_OK" != "true" ]]; then
+  if [[ "$HTTP_OK" == "true" ]]; then
+    echo "$RESPONSE"
+  else
+    if echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
+      echo "$RESPONSE"
+    else
+      echo '{"error":"non_json_response"}'
+      if [[ -n "$RESPONSE" ]]; then
+        echo "→ non-JSON response (possible proxy/LB error):" >&2
+        printf '%s\n' "$RESPONSE" | head -c 500 >&2
+        echo "" >&2
+      fi
+    fi
     exit 1
   fi
 }
@@ -116,7 +268,7 @@ POSITIONAL=()
 # Parse args
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --url) NEXUS_URL="$2"; shift 2 ;;
+    --url) URL_FLAG="$2"; shift 2 ;;
     --agent-id) AGENT_ID="$2"; shift 2 ;;
     --ttl) TTL="$2"; shift 2 ;;
     --after) AFTER="$2"; shift 2 ;;
@@ -130,11 +282,17 @@ while [[ $# -gt 0 ]]; do
 done
 set -- "${POSITIONAL[@]}"
 
+# Resolve the effective server (--url > env > config > default) once, up front.
+resolve_server_url
+
 CMD="${1:-help}"
 shift || true
 
 case "$CMD" in
   create)
+    if [[ -z "${TTL:-}" ]]; then
+      echo "⚠️  TTL not specified — using default 3660s (~1h)" >&2
+    fi
     TTL_VAL="${TTL:-3660}"
     BODY="{\"ttl\": $TTL_VAL}"
 
@@ -150,6 +308,7 @@ case "$CMD" in
       BODY=$(echo "$BODY" | jq -c --arg creatorAgentId "$CREATOR_AGENT_ID" '. + {creatorAgentId: $creatorAgentId}')
     fi
 
+    net_preamble
     http_request -X PUT "$NEXUS_URL/v1/sessions" \
       -H "Content-Type: application/json" \
       -d "$BODY"
@@ -159,6 +318,7 @@ case "$CMD" in
       SESSION_ID=$(echo "$RESPONSE" | jq -r '.sessionId // empty')
       if [[ -n "$SESSION_ID" ]]; then
         mkdir -p "$NEXUS_DATA_DIR/$SESSION_ID"
+        write_binding "$SESSION_ID"
         AGENT_FILE="$NEXUS_DATA_DIR/$SESSION_ID/agent"
         echo "$CREATOR_AGENT_ID" > "$AGENT_FILE"
 
@@ -217,6 +377,7 @@ case "$CMD" in
 
     ACTIVE_ONLY=""
     JSON_OUT=""
+    STATUS_TIMEOUT="${NEXUS_STATUS_TIMEOUT:-3}"
     for arg in "$@"; do
       case "$arg" in
         --active) ACTIVE_ONLY="true" ;;
@@ -224,6 +385,7 @@ case "$CMD" in
       esac
     done
 
+    net_preamble
     SESSIONS_JSON="[]"
     for session_dir in "$NEXUS_DATA_DIR"/*/; do
       [[ -d "$session_dir" ]] || continue
@@ -237,16 +399,23 @@ case "$CMD" in
 
       ALIAS_NAME=$(reverse_alias "$SID")
 
-      # Check session status via API (quick, non-blocking)
-      STATUS_RESP=$(curl -s --max-time 3 "$NEXUS_URL/v1/sessions/$SID" 2>/dev/null || echo '{"error":"timeout"}')
-      IS_ERROR=$(echo "$STATUS_RESP" | jq -r '.error // empty')
-      if [[ -n "$IS_ERROR" ]]; then
-        SESSION_STATUS="expired"
-      else
-        SESSION_STATUS="active"
-      fi
+      # Probe each session against ITS OWN bound server (unbound → effective URL),
+      # so a wrong global env can no longer poison the whole listing.
+      # Classify by HTTP code, not response body: separates transport failure
+      # (curl exit != 0 → "000") from application errors (404 vs other).
+      PROBE_URL="$NEXUS_URL"
+      [[ -f "$session_dir/server" ]] && PROBE_URL=$(normalize_url "$(cat "$session_dir/server")")
+      HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time "$STATUS_TIMEOUT" \
+        "$PROBE_URL/v1/sessions/$SID" 2>/dev/null) || HTTP_CODE="000"
+      case "$HTTP_CODE" in
+        200)     SESSION_STATUS="active" ;;
+        404)     SESSION_STATUS="not_found" ;;
+        000|"")  SESSION_STATUS="unreachable" ;;  # timeout, refused, DNS — transport failed
+        *)       SESSION_STATUS="error" ;;        # 5xx, 429, anything else
+      esac
 
-      if [[ "$ACTIVE_ONLY" == "true" && "$SESSION_STATUS" != "active" ]]; then
+      # --active keeps possibly-alive sessions (active + unreachable); drops not_found/error.
+      if [[ "$ACTIVE_ONLY" == "true" && "$SESSION_STATUS" != "active" && "$SESSION_STATUS" != "unreachable" ]]; then
         continue
       fi
 
@@ -256,7 +425,8 @@ case "$CMD" in
         --arg agent "$AGENT" \
         --arg status "$SESSION_STATUS" \
         --arg cursor "$CURSOR" \
-        '. + [{sessionId: $sid, alias: ($alias | if . == "" then null else . end), agentId: $agent, status: $status, cursor: ($cursor | if . == "" then null else . end)}]')
+        --arg server "$PROBE_URL" \
+        '. + [{sessionId: $sid, alias: ($alias | if . == "" then null else . end), agentId: $agent, status: $status, server: $server, cursor: ($cursor | if . == "" then null else . end)}]')
     done
 
     # Table format for TTY, JSON always on stdout
@@ -267,10 +437,10 @@ case "$CMD" in
         echo '{"sessions":[]}'
         exit 0
       fi
-      printf "%-12s %-14s %-12s %-8s\n" "ALIAS" "SESSION" "AGENT-ID" "STATUS" >&2
+      printf "%-12s %-14s %-12s %-12s\n" "ALIAS" "SESSION" "AGENT-ID" "STATUS" >&2
       echo "$SESSIONS_JSON" | jq -r '.[] | [(.alias // "—"), (.sessionId[:12] + "..."), .agentId, .status] | @tsv' | \
         while IFS=$'\t' read -r a s ag st; do
-          printf "%-12s %-14s %-12s %-8s\n" "$a" "$s" "$ag" "$st" >&2
+          printf "%-12s %-14s %-12s %-12s\n" "$a" "$s" "$ag" "$st" >&2
         done
     fi
 
@@ -290,11 +460,21 @@ case "$CMD" in
     LS_ARGS=""
     [[ "$ACTIVE_ONLY" == "true" ]] && LS_ARGS="--active"
 
-    SESSIONS=$("$0" ls $LS_ARGS --json 2>/dev/null | jq -c '.sessions[]' 2>/dev/null)
+    LS_JSON=$("$0" ls $LS_ARGS --json 2>/dev/null)
+    SESSIONS=$(echo "$LS_JSON" | jq -c '.sessions[]' 2>/dev/null)
     if [[ -z "$SESSIONS" ]]; then
       echo '{"sessions":[]}'
       exit 0
     fi
+
+    # Provenance: poll-all delegates to per-session `poll` (each follows its own
+    # binding), so a single "→ server" line would mislead. Summarize the distinct
+    # servers actually being contacted. Count/servers use the SAME filter as the
+    # poll loop below (active + unreachable) — else an --active-less run would
+    # overstate the count by including not_found/error sessions it never polls.
+    PA_COUNT=$(echo "$LS_JSON" | jq '[.sessions[] | select(.status=="active" or .status=="unreachable")] | length' 2>/dev/null || echo 0)
+    PA_SERVERS=$(echo "$LS_JSON" | jq -r '[.sessions[] | select(.status=="active" or .status=="unreachable") | .server] | map(sub("^https?://";"")) | unique | join(", ")' 2>/dev/null || true)
+    [[ "$PA_COUNT" -gt 0 ]] && echo "→ polling $PA_COUNT session(s) across: ${PA_SERVERS:-?} (per-session bindings)" >&2
 
     RESULTS="[]"
     TOTAL_MSGS=0
@@ -304,7 +484,11 @@ case "$CMD" in
       ALIAS_NAME=$(echo "$session" | jq -r '.alias // empty')
       STATUS=$(echo "$session" | jq -r '.status')
 
-      if [[ "$STATUS" != "active" ]]; then
+      # Mirror ls --active: poll active + unreachable (may be a transient blip
+      # that has since cleared); skip not_found/error (server disowned it).
+      # Without unreachable here, poll-all --active would silently drop live
+      # sessions on a network blip — the exact bug this change fixes.
+      if [[ "$STATUS" != "active" && "$STATUS" != "unreachable" ]]; then
         continue
       fi
 
@@ -335,19 +519,24 @@ case "$CMD" in
   status)
     SESSION_ID="${1:?Usage: nexus.sh status <SESSION_ID>}"
     SESSION_ID=$(resolve_session "$SESSION_ID")
+    route_session_server "$SESSION_ID"
+    net_preamble
     http_request "$NEXUS_URL/v1/sessions/$SESSION_ID"
     emit_response
+    adopt_binding_if_unbound "$SESSION_ID"
     ;;
 
   join)
     SESSION_ID="${1:?Usage: nexus.sh join <SESSION_ID> --agent-id ID}"
     SESSION_ID=$(resolve_session "$SESSION_ID")
     [[ -z "$AGENT_ID" ]] && echo '{"error":"missing --agent-id"}' && exit 1
+    net_preamble
     http_request -X POST "$NEXUS_URL/v1/sessions/$SESSION_ID/join" \
       -H "X-Agent-Id: $AGENT_ID"
     emit_response
 
     mkdir -p "$NEXUS_DATA_DIR/$SESSION_ID"
+    write_binding "$SESSION_ID"
     AGENT_FILE="$NEXUS_DATA_DIR/$SESSION_ID/agent"
     echo "$AGENT_ID" > "$AGENT_FILE"
 
@@ -361,16 +550,20 @@ case "$CMD" in
   pair)
     SESSION_ID="${1:?Usage: nexus.sh pair <SESSION_ID>}"
     SESSION_ID=$(resolve_session "$SESSION_ID")
+    route_session_server "$SESSION_ID"
+    net_preamble
     http_request -X PUT "$NEXUS_URL/v1/pair" \
       -H "Content-Type: application/json" \
       -d "{\"sessionId\": \"$SESSION_ID\"}"
     emit_response
+    adopt_binding_if_unbound "$SESSION_ID"
     ;;
 
   claim)
     CODE="${1:?Usage: nexus.sh claim <CODE> --agent-id ID}"
     [[ -z "$AGENT_ID" ]] && echo '{"error":"missing --agent-id"}' && exit 1
 
+    net_preamble
     http_request -X POST "$NEXUS_URL/v1/pair/$CODE/claim" \
       -H "X-Agent-Id: $AGENT_ID"
     emit_response
@@ -378,6 +571,7 @@ case "$CMD" in
     SESSION_ID=$(echo "$RESPONSE" | jq -r '.sessionId // empty')
     if [[ -n "$SESSION_ID" ]]; then
       mkdir -p "$NEXUS_DATA_DIR/$SESSION_ID"
+      write_binding "$SESSION_ID"
       AGENT_FILE="$NEXUS_DATA_DIR/$SESSION_ID/agent"
       echo "$AGENT_ID" > "$AGENT_FILE"
 
@@ -395,6 +589,7 @@ case "$CMD" in
 
   pair-status)
     CODE="${1:?Usage: nexus.sh pair-status <CODE>}"
+    net_preamble
     http_request "$NEXUS_URL/v1/pair/$CODE/status"
     emit_response
     ;;
@@ -402,6 +597,8 @@ case "$CMD" in
   send)
     SESSION_ID="${1:?Usage: nexus.sh send <SESSION_ID> \"text\" [--json PAYLOAD] [--strict]}"
     SESSION_ID=$(resolve_session "$SESSION_ID")
+    route_session_server "$SESSION_ID"
+    net_preamble
     shift || true
 
     TEXT=""
@@ -471,7 +668,7 @@ case "$CMD" in
       fi
     else
       # Plain text-only send
-      BODY=$(printf '%s' "$TEXT" | jq -c '{text: .}')
+      BODY=$(printf '%s' "$TEXT" | jq -Rs -c '{text: .}')
     fi
 
     KEY_FILE="$NEXUS_DATA_DIR/$SESSION_ID/key"
@@ -488,11 +685,14 @@ case "$CMD" in
         -d "$BODY"
     fi
     emit_response
+    adopt_binding_if_unbound "$SESSION_ID"
     ;;
 
   poll)
     SESSION_ID="${1:?Usage: nexus.sh poll <SESSION_ID> [--agent-id ID] [--after CURSOR] [--members]}"
     SESSION_ID=$(resolve_session "$SESSION_ID")
+    route_session_server "$SESSION_ID"
+    net_preamble
 
     if [[ -z "$AGENT_ID" ]]; then
       mkdir -p "$NEXUS_DATA_DIR/$SESSION_ID"
@@ -536,6 +736,7 @@ case "$CMD" in
     http_request "$NEXUS_URL/v1/sessions/$SESSION_ID/messages$QUERY" \
       -H "X-Agent-Id: $AGENT_ID"
     emit_response
+    adopt_binding_if_unbound "$SESSION_ID"
 
     NEXT_CURSOR=$(echo "$RESPONSE" | jq -r '.nextCursor // empty')
     if [[ -z "$AFTER" && -n "$NEXT_CURSOR" ]]; then
@@ -566,6 +767,8 @@ case "$CMD" in
   poll-daemon)
     SESSION_ID="${1:?Usage: nexus.sh poll-daemon <SESSION_ID> [--agent-id ID] [--interval N] [--ttl N]}"
     SESSION_ID=$(resolve_session "$SESSION_ID")
+    route_session_server "$SESSION_ID"
+    net_preamble
 
     if [[ -z "$AGENT_ID" ]]; then
       mkdir -p "$NEXUS_DATA_DIR/$SESSION_ID"
@@ -619,6 +822,8 @@ case "$CMD" in
   heartbeat)
     SESSION_ID="${1:?Usage: nexus.sh heartbeat <SESSION_ID> [--agent-id ID] [--interval N]}"
     SESSION_ID=$(resolve_session "$SESSION_ID")
+    route_session_server "$SESSION_ID"
+    net_preamble
 
     if [[ -z "$AGENT_ID" ]]; then
       mkdir -p "$NEXUS_DATA_DIR/$SESSION_ID"
@@ -655,6 +860,8 @@ case "$CMD" in
   renew)
     SESSION_ID="${1:?Usage: nexus.sh renew <SESSION_ID> [--ttl N] [--agent-id ID]}"
     SESSION_ID=$(resolve_session "$SESSION_ID")
+    route_session_server "$SESSION_ID"
+    net_preamble
 
     if [[ -z "$AGENT_ID" ]]; then
       mkdir -p "$NEXUS_DATA_DIR/$SESSION_ID"
@@ -683,6 +890,7 @@ case "$CMD" in
         -d "{}"
     fi
     emit_response
+    adopt_binding_if_unbound "$SESSION_ID"
 
     EXPIRES_AT=$(echo "$RESPONSE" | jq -r '.expiresAt // empty')
     if [[ -n "$EXPIRES_AT" ]]; then
@@ -699,6 +907,8 @@ case "$CMD" in
       LEAVE_ALIAS=$(jq -r --arg name "$1" 'if has($name) then $name else empty end' "$NEXUS_ALIASES_FILE" 2>/dev/null || true)
     fi
     SESSION_ID=$(resolve_session "$SESSION_ID")
+    route_session_server "$SESSION_ID"
+    net_preamble
 
     if [[ -z "$AGENT_ID" ]]; then
       mkdir -p "$NEXUS_DATA_DIR/$SESSION_ID"
@@ -718,31 +928,86 @@ case "$CMD" in
     http_request -X DELETE "$NEXUS_URL/v1/sessions/$SESSION_ID/agents/$AGENT_ID" \
       -H "X-Agent-Id: $AGENT_ID" \
       -H "X-Session-Key: $(cat "$KEY_FILE")"
-    emit_response
 
-    OK=$(echo "$RESPONSE" | jq -r '.ok // false')
-
-    # Always clean up local data — even if server leave fails (e.g. session expired/404).
-    # The agent decided to leave; local state must not survive to be re-discovered on restart.
-    rm -rf "$NEXUS_DATA_DIR/$SESSION_ID"
-    # Auto-remove alias if one exists
-    if [[ -n "$LEAVE_ALIAS" ]]; then
-      remove_alias "$LEAVE_ALIAS"
+    # Parse response — handle potentially non-JSON bodies from proxies
+    OK="false"
+    ERROR=""
+    if echo "$RESPONSE" | jq -e . >/dev/null 2>&1; then
+      echo "$RESPONSE"
+      OK=$(echo "$RESPONSE" | jq -r '.ok // false')
+      ERROR=$(echo "$RESPONSE" | jq -r '.error // empty')
     else
-      # Check by session ID (reverse lookup)
-      FOUND_ALIAS=$(reverse_alias "$SESSION_ID")
-      if [[ -n "$FOUND_ALIAS" ]]; then
-        remove_alias "$FOUND_ALIAS"
+      echo '{"error":"non_json_response"}'
+      ERROR="non_json_response"
+    fi
+
+    # Decision table: cleanup local state based on error class
+    # 2xx ok — remove local state, exit 0
+    if [[ "$HTTP_OK" == "true" && "$OK" == "true" ]]; then
+      cleanup_leave_state "$SESSION_ID" "$LEAVE_ALIAS"
+      echo "" >&2
+      echo "✅ Left session. Local data cleaned up." >&2
+      exit 0
+    fi
+
+    # 404 session_not_found / agent_not_found — session gone or agent no longer
+    # a member; idempotent cleanup either way
+    if [[ "$ERROR" == "session_not_found" || "$ERROR" == "agent_not_found" ]]; then
+      cleanup_leave_state "$SESSION_ID" "$LEAVE_ALIAS"
+      echo "" >&2
+      echo "⚠️  $ERROR on server — local data cleaned up." >&2
+      exit 0
+    fi
+
+    # 401 invalid_session_key — cross-check with unauthenticated GET.
+    # GET /v1/sessions/:id is public (no auth), returns agents[] membership.
+    # Decision is on HTTP status code, NOT on a response body field — the server
+    # does NOT include `ok` in the GET session response shape.
+    if [[ "$ERROR" == "invalid_session_key" ]]; then
+      get_resp=$(curl -s -w $'\n%{http_code}' --max-time "${NEXUS_HTTP_TIMEOUT:-10}" \
+        "$NEXUS_URL/v1/sessions/$SESSION_ID" 2>/dev/null) || get_resp=""
+      get_code="${get_resp##*$'\n'}"; get_body="${get_resp%$'\n'*}"
+      [[ "$get_code" =~ ^[0-9]+$ ]] || get_code="000"
+
+      if [[ "$get_code" == "404" ]]; then
+        # Session does not exist → idempotent cleanup
+        cleanup_leave_state "$SESSION_ID" "$LEAVE_ALIAS"
+        echo "" >&2
+        echo "⚠️  Session expired on server — local data cleaned up." >&2
+        exit 0
+      fi
+      if [[ "$get_code" != "200" ]]; then
+        # Transient / transport error → preserve, retry later
+        echo "" >&2
+        echo "⚠️  Cannot verify session state (HTTP $get_code) — local state preserved for retry." >&2
+        exit 1
+      fi
+      # Session exists — check if agent is still a member
+      if echo "$get_body" | jq -e --arg a "$AGENT_ID" '.agents | index($a)' >/dev/null 2>&1; then
+        # Agent IS a member but key is wrong → real problem, preserve for retry
+        echo "" >&2
+        echo "⚠️  Invalid session key but agent is still a member — local state preserved for retry." >&2
+        exit 1
+      else
+        # Agent is NOT a member (evicted or already left) → idempotent cleanup
+        cleanup_leave_state "$SESSION_ID" "$LEAVE_ALIAS"
+        echo "" >&2
+        echo "⚠️  Agent no longer a member of session — local data cleaned up." >&2
+        exit 0
       fi
     fi
 
-    if [[ "$OK" == "true" ]]; then
+    # 403 forbidden — creator cannot leave, session is alive
+    if [[ "$ERROR" == "forbidden" ]]; then
       echo "" >&2
-      echo "✅ Left session. Local data cleaned up." >&2
-    else
-      echo "" >&2
-      echo "⚠️ Server leave failed (session may have expired). Local data cleaned up." >&2
+      echo "⚠️  Creator cannot leave the session — local state preserved." >&2
+      exit 1
     fi
+
+    # Transport failure, 429, 5xx, or unknown error — preserve for retry
+    echo "" >&2
+    echo "⚠️  Server leave failed (${ERROR:-transport error}) — local state preserved for retry." >&2
+    exit 1
     ;;
 
   poll-status)
@@ -765,6 +1030,159 @@ case "$CMD" in
           fi
         done
       fi
+    fi
+    ;;
+
+  config)
+    SUB="${1:-show}"
+    case "$SUB" in
+      set-url)
+        CFG_URL="${2:?Usage: nexus.sh config set-url <URL>}"
+        if [[ ! "$CFG_URL" =~ ^https?://[^/]+ ]]; then
+          echo '{"error":"invalid URL — must be http(s)://host"}'
+          exit 1
+        fi
+        CFG_NORM=$(normalize_url "$CFG_URL")
+        mkdir -p "$(dirname "$NEXUS_CONFIG_FILE")"
+        jq -n --arg u "$CFG_NORM" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          '{serverUrl: $u, updatedAt: $t}' > "$NEXUS_CONFIG_FILE"
+        jq -n --arg u "$CFG_NORM" '{ok: true, serverUrl: $u}'
+        echo "✅ Server configured: $CFG_NORM" >&2
+        ;;
+      show)
+        jq -n --arg u "$NEXUS_URL" --arg s "$SERVER_SOURCE" --arg p "$NEXUS_CONFIG_FILE" \
+          '{serverUrl: $u, source: $s, configPath: $p}'
+        ;;
+      unset)
+        if [[ -f "$NEXUS_CONFIG_FILE" ]]; then
+          TMP=$(jq -c 'del(.serverUrl)' "$NEXUS_CONFIG_FILE" 2>/dev/null || echo '{}')
+          echo "$TMP" > "$NEXUS_CONFIG_FILE"
+        fi
+        echo '{"ok":true}'
+        echo "✅ Server config unset" >&2
+        ;;
+      *)
+        jq -n --arg s "$SUB" '{error: ("unknown config subcommand: " + $s + " (use set-url|show|unset)")}'
+        exit 1
+        ;;
+    esac
+    ;;
+
+  bind)
+    SESSION_ID="${1:?Usage: nexus.sh bind <SESSION_ID>}"
+    SESSION_ID=$(resolve_session "$SESSION_ID")
+    net_preamble
+    # Adopt the session only if the EFFECTIVE server actually knows it (200).
+    BIND_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time "${NEXUS_HTTP_TIMEOUT:-10}" \
+      "$NEXUS_URL/v1/sessions/$SESSION_ID" 2>/dev/null) || BIND_CODE="000"
+    if [[ "$BIND_CODE" == "200" ]]; then
+      mkdir -p "$NEXUS_DATA_DIR/$SESSION_ID"
+      echo "$NEXUS_URL" > "$NEXUS_DATA_DIR/$SESSION_ID/server"
+      jq -n --arg sid "$SESSION_ID" --arg srv "$NEXUS_URL" '{ok: true, sessionId: $sid, server: $srv}'
+      echo "✅ Bound ${SESSION_ID:0:12}… → $NEXUS_URL" >&2
+    else
+      jq -n --arg srv "$NEXUS_URL" --arg code "$BIND_CODE" --arg sid "$SESSION_ID" \
+        '{error: ("session not found on " + $srv + " (HTTP " + $code + ")"), sessionId: $sid}'
+      exit 1
+    fi
+    ;;
+
+  doctor)
+    net_preamble
+    EFFECTIVE="$NEXUS_URL"
+    OVERALL_OK=true
+    DIVERGENCE=false
+    HTIMEOUT="${NEXUS_HTTP_TIMEOUT:-10}"
+    STIMEOUT="${NEXUS_STATUS_TIMEOUT:-3}"
+
+    # Distinct servers = effective + every bound server in local state.
+    # ponytail: newline list + sort -u instead of an assoc array — bash 3.2 safe.
+    SERVERS_LIST="$EFFECTIVE"
+    if [[ -d "$NEXUS_DATA_DIR" ]]; then
+      for d in "$NEXUS_DATA_DIR"/*/; do
+        [[ -f "$d/server" ]] || continue
+        SERVERS_LIST="$SERVERS_LIST"$'\n'"$(normalize_url "$(cat "$d/server")")"
+      done
+    fi
+
+    HEALTH_JSON="[]"
+    while IFS= read -r s; do
+      [[ -n "$s" ]] || continue
+      H=$(curl -s --max-time "$HTIMEOUT" "$s/health" 2>/dev/null || true)
+      if [[ -n "$H" ]] && echo "$H" | jq -e . >/dev/null 2>&1; then
+        VER=$(echo "$H" | jq -r '.version // "unknown"')
+        UP=$(echo "$H" | jq -r '.uptime // empty')
+        REACH=true
+      else
+        VER="unknown"; UP=""; REACH=false; OVERALL_OK=false
+      fi
+      [[ "$UP" =~ ^[0-9]+$ ]] && UP_JSON="$UP" || UP_JSON=null
+      HEALTH_JSON=$(echo "$HEALTH_JSON" | jq -c \
+        --arg s "$s" --argjson reach "$REACH" --arg ver "$VER" --argjson up "$UP_JSON" \
+        '. + [{server: $s, reachable: $reach, version: $ver, uptime: $up}]')
+    done <<< "$(printf '%s\n' "$SERVERS_LIST" | sort -u)"
+
+    SESS_JSON="[]"
+    if [[ -d "$NEXUS_DATA_DIR" ]]; then
+      for d in "$NEXUS_DATA_DIR"/*/; do
+        [[ -d "$d" ]] || continue
+        DSID=$(basename "$d")
+        BOUND=""; [[ -f "$d/server" ]] && BOUND=$(normalize_url "$(cat "$d/server")")
+        PROBE="${BOUND:-$EFFECTIVE}"
+        DAGENT=""; [[ -f "$d/agent" ]] && DAGENT=$(cat "$d/agent")
+
+        # Divergence is SURFACED (visibility), not a failure: per-session binding
+        # across servers is the supported, self-healing model — the binding is
+        # routing correctly, so it must not make a healthy setup exit non-zero.
+        [[ -n "$BOUND" && "$BOUND" != "$EFFECTIVE" ]] && DIVERGENCE=true
+
+        # Single probe: capture body + status code in one request (was two — the
+        # duplicate GET doubled rate-limit pressure on many-session setups).
+        PRESP=$(curl -s -w $'\n%{http_code}' --max-time "$STIMEOUT" "$PROBE/v1/sessions/$DSID" 2>/dev/null || true)
+        PCODE="${PRESP##*$'\n'}"; PBODY="${PRESP%$'\n'*}"
+        [[ "$PCODE" =~ ^[0-9]+$ ]] || PCODE="000"
+        MEMBER=null
+        if [[ "$PCODE" == "200" ]]; then
+          if echo "$PBODY" | jq -e --arg a "$DAGENT" '.agents | index($a)' >/dev/null 2>&1; then
+            MEMBER=true
+          else
+            MEMBER=false; OVERALL_OK=false
+          fi
+        else
+          OVERALL_OK=false
+        fi
+
+        # The key file is written only by create/join/claim; poll-only and
+        # TOFU-adopted sessions legitimately have none. Absent → not a failure;
+        # present but group/other-readable → a real security problem.
+        KEY_STATE="absent"
+        if [[ -f "$d/key" ]]; then
+          KPERM=$(stat -c '%a' "$d/key" 2>/dev/null || stat -f '%Lp' "$d/key" 2>/dev/null || echo "")
+          if [[ "$KPERM" == "600" || "$KPERM" == "400" ]]; then KEY_STATE="ok"; else KEY_STATE="insecure"; OVERALL_OK=false; fi
+        fi
+
+        CODE_JSON=$((10#$PCODE))
+        SESS_JSON=$(echo "$SESS_JSON" | jq -c \
+          --arg sid "$DSID" --arg bound "$BOUND" --arg probe "$PROBE" \
+          --argjson code "$CODE_JSON" --argjson member "$MEMBER" --arg keyfile "$KEY_STATE" \
+          '. + [{sessionId: $sid, bound: ($bound | if . == "" then null else . end), probed: $probe, httpCode: $code, memberOfSession: $member, keyFile: $keyfile}]')
+      done
+    fi
+
+    jq -n \
+      --arg eff "$EFFECTIVE" --arg src "$SERVER_SOURCE" \
+      --argjson diverge "$DIVERGENCE" --argjson ok "$OVERALL_OK" \
+      --argjson health "$HEALTH_JSON" --argjson sessions "$SESS_JSON" \
+      '{effectiveServer: $eff, source: $src, divergence: $diverge, ok: $ok, health: $health, sessions: $sessions}'
+
+    [[ "$DIVERGENCE" == "true" ]] && \
+      echo "ℹ️  note: some sessions are bound to a server other than $EFFECTIVE (the binding routes them there correctly)" >&2
+    if [[ "$OVERALL_OK" == "true" ]]; then
+      echo "✅ doctor: all checks passed" >&2
+      exit 0
+    else
+      echo "⚠️  doctor: problems found (see JSON report)" >&2
+      exit 1
     fi
     ;;
 
@@ -817,9 +1235,12 @@ Commands:
   poll-daemon <SESSION> [--interval N]    Poll with TTL tracking
   heartbeat <SESSION> [--interval N]      Continuous polling loop
   poll-status                              Show active polling processes
+  config set-url <URL>|show|unset          Persist / inspect the server URL
+  bind <SESSION>                          Bind a session to the current server (verifies first)
+  doctor                                  Diagnose server identity + per-session health
 
 Options:
-  --url URL           Server URL (default: \$NEXUS_URL or https://messaging.md)
+  --url URL           Server URL. Resolution: --url > \$NEXUS_URL > config > https://messaging.md
   --agent-id ID       Agent identifier (optional after join/claim)
   --ttl N             Session TTL in seconds
   --max-agents N      Maximum agents per session (default: 50)

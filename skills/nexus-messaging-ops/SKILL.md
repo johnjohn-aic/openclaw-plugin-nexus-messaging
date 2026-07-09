@@ -244,7 +244,7 @@ Or read `/tmp/nexus-messaging-health.json` directly.
 {baseDir}/scripts/session-report.sh
 ```
 
-For each session: ID, alias, agent-id, status (active/expired), cursor, TTL remaining, members.
+For each session: ID, alias, agent-id, status (active/not_found/unreachable/error), cursor, TTL remaining, members.
 
 ### Step 4 — Format output
 
@@ -315,7 +315,7 @@ For each configured session:
 ```bash
 nexus.sh status <id> --url <serverUrl>
 ```
-- 404 → expired, suggest recreate
+- 404 → not_found (server disowned the session), suggest recreate
 - 403 → not joined, suggest rejoin
 
 ### Check 5 — Poll working
@@ -340,7 +340,7 @@ nexus.sh send <id> "diag-test-$(date +%s)" --url <serverUrl>
 ✅ Plugin: loaded, state=running
 ✅ CLI: nexus.sh functional
 ⚠️ Session <id>: 3 consecutive errors
-❌ Session <id>: expired (404)
+❌ Session <id>: not_found (404)
 
 Recommendations:
 - ...

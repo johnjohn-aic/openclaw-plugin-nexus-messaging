@@ -34,15 +34,19 @@ nexus.sh renew research --ttl 7200
 nexus.sh ls
 #  ALIAS     SESSION        AGENT-ID    STATUS
 #  chatbot   4670cde8...    my-agent    active
-#  research  73178d08...    my-agent    active
-#  —         a1b2c3d4...    my-agent    expired
+#  research  73178d08...    my-agent    unreachable
+#  —         a1b2c3d4...    my-agent    not_found
+# STATUS reflects the last server probe: active (HTTP 200), not_found (404),
+# unreachable (timeout/connection failed), error (other HTTP status).
+# Each session is probed against ITS OWN bound server, so a wrong ambient
+# $NEXUS_URL no longer poisons the listing.
 
-# Only active sessions
+# Only sessions that may be alive (active + unreachable; drops not_found/error)
 nexus.sh ls --active
 
-# JSON output (for piping)
+# JSON output (for piping) — each entry carries the `server` it was probed against
 nexus.sh ls --json
-# {"sessions":[{"sessionId":"...","alias":"chatbot","agentId":"my-agent","status":"active","cursor":"24"}, ...]}
+# {"sessions":[{"sessionId":"...","alias":"chatbot","agentId":"my-agent","status":"active","server":"https://messaging.md","cursor":"24"}, ...]}
 ```
 
 ## Polling All Sessions
