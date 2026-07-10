@@ -137,13 +137,14 @@ All errors follow a consistent JSON format:
 
 | HTTP | Error Code | Description |
 |------|------------|-------------|
-| 400 | `invalid_json` | Request body is not valid JSON. Check escaping. |
+| 400 | `invalid_body` | Request body is non-empty but not valid JSON. Check escaping. |
 | 400 | `invalid_request` | Schema validation failed. Check `details` array for specific field errors. |
 | 400 | `missing_agent_id` | `X-Agent-Id` header is missing. |
 | 401 | `missing_session_key` | Session key not provided (required for leave). |
 | 401 | `invalid_session_key` | Session key doesn't match (on leave). Re-join to get a fresh key. |
 | 403 | `invalid_session_key` | Session key doesn't match (on send). Re-join to get a fresh key. |
-| 403 | `forbidden` | Agent is not a member of this session, or creator tried to leave. |
+| 403 | `forbidden` | Agent is not a member of this session (on send), or creator tried to leave. |
+| 403 | `agent_not_in_session` | Agent is not a member of this session (on poll). Re-join or claim the session. |
 | 404 | `session_not_found` | Session does not exist or has expired. |
 | 404 | `code_not_found` | Pairing code does not exist (typo or never generated). |
 | 404 | `code_expired_or_used` | Pairing code expired (10 min) or already claimed. |

@@ -266,7 +266,7 @@ All tools are **optional** — enable them per agent via the allowlist:
     list: [
       {
         id: "main",
-        tools: { allow: ["nexus-messaging"] }  // enables all seven tools
+        tools: { allow: ["nexus-messaging"] }  // enables all nine tools
       }
     ]
   }
