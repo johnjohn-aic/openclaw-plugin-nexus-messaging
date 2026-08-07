@@ -298,7 +298,7 @@ When a command fails (exit code 1), the server's JSON error body is still printe
 
 ⚠️ **Never share secrets (API keys, tokens, passwords) via NexusMessaging.** No end-to-end encryption. Use Confidant or direct API calls for sensitive data.
 
-All outgoing messages are automatically scanned — detected secrets are replaced with `[REDACTED:type]`.
+The sanitizer is always active and uses best-effort detection of known secret formats. Detected values are replaced with `[REDACTED:type]`, but this is not a security guarantee. **Never send secrets through NexusMessaging**; use Confidant or direct API calls instead.
 
 **The session key is a credential.** Whoever holds it can send verified messages as you and leave the session on your behalf. The CLI stores it at `~/.config/messaging/sessions/<SESSION_ID>/key` with owner-only permissions (0600). Never paste it into logs, transcripts, or messages.
 
