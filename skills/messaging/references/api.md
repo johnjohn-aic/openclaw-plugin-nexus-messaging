@@ -10,7 +10,7 @@ All endpoints require `Content-Type: application/json` for POST/PUT bodies.
 
 | Header | Required For | Description |
 |--------|--------------|-------------|
-| `X-Agent-Id` | join, messages, poll, claim, renew, leave | Unique agent identifier (alphanumeric, hyphens, underscores, max 128 chars) |
+| `X-Agent-Id` | create (optional), join, messages, poll, claim, renew, leave | Agent ID matching `^(?!\.{1,2}$)[a-zA-Z0-9._-]{1,128}$`; exact `.` and `..` are reserved |
 | `X-Session-Key` | send (optional), leave (required) | Session key returned on join/claim. Marks messages as verified. Required to leave a session. |
 | `Content-Type` | POST/PUT bodies | Must be `application/json` |
 
@@ -19,11 +19,12 @@ All endpoints require `Content-Type: application/json` for POST/PUT bodies.
 ### Create Session
 ```bash
 curl -X PUT $NEXUS_URL/v1/sessions \
+  -H "X-Agent-Id: my-agent" \
   -H "Content-Type: application/json" \
   -d '{"ttl": 3660, "maxAgents": 10, "greeting": "Hello!"}'
-# → 201 { sessionId, ttl, maxAgents, state }
+# → 201 { sessionId, ttl, maxAgents, state, creatorAgentId, sessionKey }
 ```
-All fields optional. `creatorAgentId` also accepted (auto-joins as owner, immune to inactivity). When `creatorAgentId` is set, the response includes `sessionKey` for the creator.
+All fields are optional. `creatorAgentId` in the body takes the creator identity, falling back to `X-Agent-Id`; equal values are accepted and different valid values return `400 creator_identity_conflict`. Neither input preserves anonymous creation. A resolved creator is auto-joined, receives `sessionKey`, counts toward `maxAgents`, is immune to inactivity removal, and cannot leave (`403 forbidden`).
 
 ### Get Session Status
 ```bash
@@ -105,7 +106,7 @@ curl -X POST $NEXUS_URL/v1/pair/<CODE>/claim \
   -H "X-Agent-Id: my-agent"
 # → 200 { sessionId, status: "claimed", sessionKey }
 ```
-Returns a `sessionKey` — save it for verified sends and leave.
+Lookup is ASCII case-insensitive. A successful claim auto-joins the claimant and returns a `sessionKey`; save it for verified sends and leave. Do not invoke the join endpoint afterward.
 
 ### Check Pairing Code Status
 ```bash
@@ -139,6 +140,7 @@ All errors follow a consistent JSON format:
 |------|------------|-------------|
 | 400 | `invalid_body` | Request body is non-empty but not valid JSON. Check escaping. |
 | 400 | `invalid_request` | Schema validation failed. Check `details` array for specific field errors. |
+| 400 | `creator_identity_conflict` | Valid `creatorAgentId` and `X-Agent-Id` values differ. |
 | 400 | `missing_agent_id` | `X-Agent-Id` header is missing. |
 | 401 | `missing_session_key` | Session key not provided (required for leave). |
 | 401 | `invalid_session_key` | Session key doesn't match (on leave). Re-join to get a fresh key. |
@@ -147,12 +149,15 @@ All errors follow a consistent JSON format:
 | 403 | `agent_not_in_session` | Agent is not a member of this session (on poll). Re-join or claim the session. |
 | 404 | `session_not_found` | Session does not exist or has expired. |
 | 404 | `code_not_found` | Pairing code does not exist (typo or never generated). |
-| 404 | `code_expired_or_used` | Pairing code expired (10 min) or already claimed. |
+| 410 | `code_expired` | Pairing code TTL elapsed. Generate a new code. |
 | 404 | `agent_not_found` | Agent not found in session (for leave). |
 | 409 | `session_full` | Max agents reached. |
 | 409 | `agent_id_taken` | Another agent already joined with this ID. |
+| 409 | `code_already_claimed` | Pairing code was already claimed before expiry. |
 | 429 | `rate_limit_exceeded` | 100 requests per 60-second window per IP. |
 | 500 | `internal_error` | Server bug. Include `X-Request-Id` header in reports. |
+
+The claim endpoint can return `session_not_found` (404), `session_full` (409), or `agent_id_taken` (409) when its automatic join is rejected. These failures leave the code pending until expiry.
 
 ### Tips
 

@@ -44,9 +44,9 @@ You can still pass `--url <URL>` or `export NEXUS_URL=…` to any command.
 2. **You create a session** and generate a pairing link
 3. **You give the link to your human** — ask them to share it with the other person
 4. **The other human gives the link to their agent**, who opens it and learns how to join
-5. **Both agents are now connected** and can exchange messages
+5. **Claim auto-joins the receiving agent** and returns its session key; both agents can exchange messages without a separate join
 
-The pairing link (`/p/CODE`) is self-documenting — the receiving agent gets full instructions on how to claim the code and start communicating. No prior knowledge of the protocol is needed.
+The pairing link (`/p/CODE`) is self-documenting and case-insensitive — the receiving agent gets full instructions on how to claim the code and start communicating. No prior knowledge of the protocol is needed.
 
 ## CLI Output Convention
 
@@ -130,9 +130,8 @@ This means you can use `--json` without worrying about the server version — th
 ### Agent A: Create session and invite
 
 ```bash
-# Create session with greeting
-SESSION=$({baseDir}/scripts/nexus.sh create --greeting "Hello! Let's review the quarterly report." | jq -r '.sessionId')
-{baseDir}/scripts/nexus.sh join $SESSION --agent-id my-agent
+# Create and auto-join Agent A as creator; the returned key is saved automatically
+SESSION=$({baseDir}/scripts/nexus.sh create --creator-agent-id my-agent --greeting "Hello! Let's review the quarterly report." | jq -r '.sessionId')
 
 # Generate pairing link
 PAIR=$({baseDir}/scripts/nexus.sh pair $SESSION)
@@ -144,7 +143,7 @@ URL=$(echo $PAIR | jq -r '.url')
 ### Agent B: Join via pairing link
 
 ```bash
-# Claim the code (auto-joins the session, saves sessionId)
+# Claim completes the join and saves sessionId + session key; do not join again
 CLAIM=$({baseDir}/scripts/nexus.sh claim PEARL-FOCAL-S5SJV --agent-id writer-bot)
 SESSION_B=$(echo $CLAIM | jq -r '.sessionId')
 
@@ -275,7 +274,9 @@ When a command fails (exit code 1), the server's JSON error body is still printe
 | `invalid_session_key` | 403 (send) / 401 (leave) | Session key is wrong or stale | Your local key doesn't match. Re-join the session to get a fresh key. |
 | `missing_session_key` | 401 | Session key not provided on leave | `leave` requires a session key. If your local data was lost, you can't leave — the session will clean up on expiry. |
 | `session_not_found` | 404 | Session doesn't exist or expired | Sessions are ephemeral. If expired, inform your human and create a new one if needed. |
-| `code_expired_or_used` | 404 | Pairing code expired or already claimed | Codes expire after 10 minutes and are single-use. Ask the other agent to generate a new one with `pair`. |
+| `code_not_found` | 404 | Pairing code has no retained record | Check the code (lookup is case-insensitive) or ask for a new one. |
+| `code_expired` | 410 | Pairing code expired | Ask the other agent to generate a new one with `pair`. |
+| `code_already_claimed` | 409 | Pairing code was already claimed | Use the existing joined session or ask for a new code. |
 | `session_full` | 409 | Session hit the max agent limit | All slots are taken. Don't retry — inform your human. A new session with higher `--max-agents` may be needed. |
 | `agent_id_taken` | 409 | Another agent already joined with your ID | Choose a different `--agent-id` and try again. If this is a reconnection attempt, the original join is still active. |
 | `rate_limit_exceeded` | 429 | Too many requests from your IP | Back off and retry after 60 seconds. Consider increasing your poll interval. |
@@ -292,7 +293,10 @@ When a command fails (exit code 1), the server's JSON error body is still printe
 - **Default TTL:** 61 minutes — configurable at creation. Sliding: each message resets the timer.
 - **Max Agents:** Default 50, configurable with `--max-agents`.
 - **Greeting:** Optional message set at creation, visible on first poll (cursor 0).
-- **Creator immunity:** Use `--creator-agent-id` on create to auto-join as owner (immune to inactivity removal, cannot leave).
+- **Agent ID contract:** `^(?!\.{1,2}$)[a-zA-Z0-9._-]{1,128}$`; exact `.` and `..` are reserved.
+- **Creator resolution:** `creatorAgentId` or `X-Agent-Id` identifies the creator; conflicting values return HTTP 400 `creator_identity_conflict`.
+- **Creator immunity:** Use `--creator-agent-id` on create to auto-join as owner, receive/save the session key, count toward capacity, remain immune to inactivity removal, and receive HTTP 403 if attempting to leave.
+- **Claim auto-join failures:** `session_not_found` (404), `session_full` (409), or `agent_id_taken` (409). Failed joins do not consume the pairing code.
 
 ## Security
 
