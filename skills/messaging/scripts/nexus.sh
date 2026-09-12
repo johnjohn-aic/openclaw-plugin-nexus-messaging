@@ -309,18 +309,30 @@ case "$CMD" in
     fi
 
     net_preamble
-    http_request -X PUT "$NEXUS_URL/v1/sessions" \
-      -H "Content-Type: application/json" \
-      -d "$BODY"
+    # --agent-id owns the header, --creator-agent-id owns the body field; the
+    # server resolves/validates the two (conflict → creator_identity_conflict).
+    if [[ -n "${AGENT_ID:-}" ]]; then
+      http_request -X PUT "$NEXUS_URL/v1/sessions" \
+        -H "Content-Type: application/json" \
+        -H "X-Agent-Id: $AGENT_ID" \
+        -d "$BODY"
+    else
+      http_request -X PUT "$NEXUS_URL/v1/sessions" \
+        -H "Content-Type: application/json" \
+        -d "$BODY"
+    fi
     emit_response
 
-    if [[ -n "${CREATOR_AGENT_ID:-}" ]]; then
+    # Persistence is response-driven: the server is the authority on whether a
+    # creator was registered (body creatorAgentId ?? X-Agent-Id header).
+    RESP_CREATOR=$(echo "$RESPONSE" | jq -r '.creatorAgentId // empty')
+    if [[ -n "$RESP_CREATOR" ]]; then
       SESSION_ID=$(echo "$RESPONSE" | jq -r '.sessionId // empty')
       if [[ -n "$SESSION_ID" ]]; then
         mkdir -p "$NEXUS_DATA_DIR/$SESSION_ID"
         write_binding "$SESSION_ID"
         AGENT_FILE="$NEXUS_DATA_DIR/$SESSION_ID/agent"
-        echo "$CREATOR_AGENT_ID" > "$AGENT_FILE"
+        echo "$RESP_CREATOR" > "$AGENT_FILE"
 
         SESSION_KEY=$(echo "$RESPONSE" | jq -r '.sessionKey // empty')
         if [[ -n "$SESSION_KEY" ]]; then
@@ -1221,7 +1233,8 @@ stdout: JSON only (pipeable to jq)
 stderr: human-readable tips and status messages
 
 Commands:
-  create [--ttl N] [--max-agents N]        Create session (default TTL: 3660s, maxAgents: 50)
+  create [--ttl N] [--max-agents N] [--agent-id ID] [--creator-agent-id ID]
+                        Create session (default TTL: 3660s, maxAgents: 50)
   status <SESSION>                        Get session status
   join <SESSION> --agent-id ID            Join a session (saves agent-id + session key)
   leave <SESSION> [--agent-id ID]         Leave a session (cleans local config + alias)

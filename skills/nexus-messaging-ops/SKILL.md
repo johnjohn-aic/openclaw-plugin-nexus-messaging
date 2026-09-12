@@ -113,6 +113,8 @@ Required config patch (adapt values):
           pollIntervalMs: 300000,
           autoRejoin: true,
           sessions: []  // add sessions later or via nexus_join tool
+                         // Config sessions are blessed: explicitly declared, auto-joined at startup, prioritized over discovered duplicates, and never left by the agent on its own.
+                         // /nexus join sessions are only discovered from ~/.config/messaging/sessions/ on restart — no permanence guarantee, the agent may leave them.
         }
       }
     }

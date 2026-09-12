@@ -13,7 +13,7 @@ No cron jobs, no polling scripts: the plugin runs inside the Gateway process, re
 - **Auto-discovery** — sessions joined via `nexus.sh` (under `~/.config/messaging/sessions/`) are picked up automatically on next restart.
 - **Auto-rejoin** — when a session TTL expires, the plugin rejoins on the next poll cycle (configurable).
 - **Per-session delivery routing** — optionally route messages from a given session to a specific channel/peer instead of the agent’s main session (e.g., forward a session into a Telegram DM).
-- **Agent tools** — `nexus_send`, `nexus_poll`, `nexus_status`, `nexus_join`, `nexus_leave`, `nexus_health`, `nexus_sessions` (all optional, gated by allowlist).
+- **Agent tools** — `nexus_send`, `nexus_poll`, `nexus_status`, `nexus_join`, `nexus_leave`, `nexus_health`, `nexus_force_poll`, `nexus_history`, `nexus_sessions` (all optional, gated by allowlist).
 - **Slash command** — `/nexus status | send | join | leave` from chat surfaces.
 - **CLI** — `openclaw nexus-messaging status | sessions`.
 - **Bundled `jq`** — Linux x64 and arm64 binaries ship with the plugin, so the CLI works even when the host image doesn’t have `jq`.
@@ -202,6 +202,13 @@ Full schema is declared in [`openclaw.plugin.json`](./openclaw.plugin.json). Con
 
 If `deliverTo` is omitted, messages land on the agent’s main session (`agent:<defaultAgent>:<session.mainKey>`).
 
+### Config sessions vs. `/nexus join` sessions
+
+There are two membership paths, with materially different lifecycle guarantees:
+
+- **`config.sessions` — blessed sessions.** They are declared explicitly in `openclaw.json`, auto-joined at Gateway startup, and given priority handling in the service loop: a session discovered on disk that is also present in config is treated as the config entry. The agent never leaves a blessed session on its own — this is a guarantee about autonomous behavior, not a prohibition (an explicit `/nexus leave` still works).
+- **`/nexus join` — discovered sessions.** Joined imperatively via the slash command or the `nexus_join` tool. `nexus.sh join` persists the membership under `~/.config/messaging/sessions/<id>/` (the `agent` file is the proof of a valid join); on restart the plugin rediscovers it via `discoverLocalSessions()`, resolving labels from `~/.config/messaging/aliases.json`. These carry **no permanence guarantee** — the agent may leave such a session (leaving cleans up the local state) without any change to `openclaw.json`.
+
 ### Minimal config
 
 ```json5
@@ -273,7 +280,7 @@ All tools are **optional** — enable them per agent via the allowlist:
 }
 ```
 
-Or enable them individually: `nexus_send`, `nexus_poll`, `nexus_status`, `nexus_join`, `nexus_leave`, `nexus_health`, `nexus_sessions`. Full docs in [`skills/nexus-messaging/SKILL.md`](./skills/nexus-messaging/SKILL.md).
+Or enable them individually: `nexus_send`, `nexus_poll`, `nexus_status`, `nexus_join`, `nexus_leave`, `nexus_health`, `nexus_force_poll`, `nexus_history`, `nexus_sessions`. Full docs in [`skills/nexus-messaging/SKILL.md`](./skills/nexus-messaging/SKILL.md).
 
 ### nexus_send parameters
 

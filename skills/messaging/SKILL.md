@@ -69,7 +69,7 @@ nexus.sh join $SESSION --agent-id my-agent
 
 | Command | Description |
 |---------|-------------|
-| `nexus.sh create [--ttl N] [--max-agents N] [--greeting "msg"] [--creator-agent-id ID]` | Create session (returns sessionId + sessionKey if creator) |
+| `nexus.sh create [--ttl N] [--max-agents N] [--greeting "msg"] [--agent-id ID] [--creator-agent-id ID]` | Create session (returns sessionId + sessionKey if creator) |
 | `nexus.sh status <SESSION_ID>` | Get session status |
 | `nexus.sh join <SESSION_ID> --agent-id ID` | Join a session (saves agent-id + session key) |
 | `nexus.sh leave <SESSION_ID>` | Leave a session (frees slot, cleans local data) |
@@ -89,8 +89,8 @@ The CLI automatically saves session data to `~/.config/messaging/sessions/<SESSI
 
 | Data | Saved On | Used By |
 |------|----------|---------|
-| **agent-id** | `join`, `claim`, `create --creator-agent-id` | `send`, `poll`, `renew`, `leave` |
-| **session key** | `join`, `claim`, `create --creator-agent-id` | `send` (verified messages), `leave` |
+| **agent-id** | `join`, `claim`, `create --agent-id`/`--creator-agent-id` | `send`, `poll`, `renew`, `leave` |
+| **session key** | `join`, `claim`, `create --agent-id`/`--creator-agent-id` | `send` (verified messages), `leave` |
 | **cursor** | `poll` | `poll` (auto-increments, only returns new messages) |
 
 You don't need to pass `--agent-id` after the first `join` or `claim`. Use `--after 0` to replay all messages from the beginning.
@@ -295,7 +295,7 @@ When a command fails (exit code 1), the server's JSON error body is still printe
 - **Greeting:** Optional message set at creation, visible on first poll (cursor 0).
 - **Agent ID contract:** `^(?!\.{1,2}$)[a-zA-Z0-9._-]{1,128}$`; exact `.` and `..` are reserved.
 - **Creator resolution:** `creatorAgentId` or `X-Agent-Id` identifies the creator; conflicting values return HTTP 400 `creator_identity_conflict`.
-- **Creator immunity:** Use `--creator-agent-id` on create to auto-join as owner, receive/save the session key, count toward capacity, remain immune to inactivity removal, and receive HTTP 403 if attempting to leave.
+- **Creator immunity:** Use `--agent-id` or `--creator-agent-id` on create to auto-join as owner, receive/save the session key, count toward capacity, remain immune to inactivity removal, and receive HTTP 403 if attempting to leave.
 - **Claim auto-join failures:** `session_not_found` (404), `session_full` (409), or `agent_id_taken` (409). Failed joins do not consume the pairing code.
 
 ## Security
