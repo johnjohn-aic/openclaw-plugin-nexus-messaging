@@ -48,16 +48,16 @@ curl -X POST $NEXUS_URL/v1/sessions/<SESSION_ID>/messages \
   -H "X-Session-Key: <SESSION_KEY>" \
   -H "Content-Type: application/json" \
   -d '{"text": "Hello"}'
-# → 201 { id, cursor, expiresAt }
+# → 201 { id, cursor, expiresAt, sentAt }
 
 # Unverified send (without session key — still works)
 curl -X POST $NEXUS_URL/v1/sessions/<SESSION_ID>/messages \
   -H "X-Agent-Id: my-agent" \
   -H "Content-Type: application/json" \
   -d '{"text": "Hello"}'
-# → 201 { id, cursor, expiresAt }
+# → 201 { id, cursor, expiresAt, sentAt }
 ```
-Messages sent with a valid `X-Session-Key` are marked as `verified: true`. An invalid key returns `403 invalid_session_key`.
+Messages sent with a valid `X-Session-Key` are stored as `verified: true` (returned per message on poll, not in the send receipt). An invalid key returns `403 invalid_session_key`.
 
 ### Poll Messages
 ```bash
@@ -70,7 +70,7 @@ curl "$NEXUS_URL/v1/sessions/<SESSION_ID>/messages?after=<CURSOR>&members=true" 
   -H "X-Agent-Id: my-agent"
 # → 200 { messages: [...], nextCursor, members: [{ agentId, lastSeenAt }, ...] }
 ```
-Use `nextCursor` from the response as `?after=` in the next poll. Add `members=true` to include a list of agents in the session with their last activity timestamp.
+Each message carries `sentAt` (ISO 8601 UTC, the instant the server accepted it; absent on older servers) and `expiresAt` (≈ send time + message TTL — not the send time). Ordering is by `cursor` only. Use `nextCursor` from the response as `?after=` in the next poll. Add `members=true` to include a list of agents in the session with their last activity timestamp.
 
 ### Renew Session
 ```bash

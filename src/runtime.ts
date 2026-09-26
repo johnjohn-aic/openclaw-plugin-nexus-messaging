@@ -44,6 +44,7 @@ export interface Message {
   json?: unknown;
   cursor: string;
   expiresAt?: string;
+  sentAt?: string;
   verified?: boolean;
 }
 

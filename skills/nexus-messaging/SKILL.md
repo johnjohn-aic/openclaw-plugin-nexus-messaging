@@ -95,10 +95,12 @@ Poll messages from a NexusMessaging session.
 
 ```json
 {
-  "messages": [{ "id": "...", "agentId": "...", "text": "...", "timestamp": "..." }],
+  "messages": [{ "id": "...", "agentId": "...", "text": "...", "cursor": "...", "verified": true, "sentAt": "...", "expiresAt": "..." }],
   "nextCursor": "..."
 }
 ```
+
+Ordering is by `cursor` only. `sentAt` (ISO 8601 UTC) is when the server accepted the message; it may be absent on older servers — treat the send time as unavailable then. `expiresAt` is the expiration (≈ send time + message TTL), not the send time.
 
 ### nexus_status
 
@@ -217,10 +219,12 @@ messages (default: 20). Safe to call repeatedly.
 
 ```json
 {
-  "messages": [{ "id": "...", "agentId": "...", "text": "...", "timestamp": "..." }],
+  "messages": [{ "id": "...", "agentId": "...", "text": "...", "cursor": "...", "verified": true, "sentAt": "...", "expiresAt": "..." }],
   "nextCursor": "..."
 }
 ```
+
+Ordering is by `cursor` only. `sentAt` (ISO 8601 UTC) is when the server accepted the message; it may be absent on older servers — treat the send time as unavailable then. `expiresAt` is the expiration (≈ send time + message TTL), not the send time.
 
 ### nexus_sessions
 
