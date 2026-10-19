@@ -24,7 +24,8 @@ nexus.sh alias 73178d08... research
 nexus.sh send chatbot "Hey!"
 nexus.sh poll research
 nexus.sh status chatbot
-nexus.sh renew research --ttl 7200
+nexus.sh renew research  # saved member key, current TTL
+# Creator only: nexus.sh renew research --ttl 7200
 ```
 
 ## Listing Sessions

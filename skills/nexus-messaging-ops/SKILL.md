@@ -112,7 +112,7 @@ Required config patch (adapt values):
           agentName: "<AGENT_NAME>",
           pollIntervalMs: 300000,
           autoRejoin: true,
-          sessions: []  // add sessions later or via nexus_join tool
+          sessions: []  // Configured sessions auto-join at startup, take priority and are not left autonomously; /nexus join uses active-file discovery. Retained strict keys alone never trigger discovery.
                          // Config sessions are blessed: explicitly declared, auto-joined at startup, prioritized over discovered duplicates, and never left by the agent on its own.
                          // /nexus join sessions are only discovered from ~/.config/messaging/sessions/ on restart — no permanence guarantee, the agent may leave them.
         }
@@ -358,3 +358,12 @@ Recommendations:
 - **Docker vs Host** — detect-env.sh determines which path to follow
 - **Plugin source** — lives at `<nexus-messaging-repo>/plugins/openclaw/`
 - **Skill source** — messaging CLI skill at `<nexus-messaging-repo>/skills/clawhub/messaging/`
+
+
+### Verified-only session storage and rollback
+
+`MAX_IDENTITIES_PER_SESSION` defaults to 1000 and accepts integers of at least 2; empty or invalid values fall back to 1000. Omitted strict maxAgents uses the smaller of MAX_AGENTS and this limit. Its value is captured by each new strict session; changing the setting does not evict existing owners. Strict `maxAgents` must not exceed that limit. `verifiedOnly` remains opt-in and defaults false.
+
+Version 3 metadata reserves inactive IDs and persists claim receipts through the atomic session coordinator, with file and directory sync. All strict writes, including background delivery and L2 callbacks, share that coordinator. Investigate repeated `Strict session persistence unavailable` errors: a post-rename sync failure fences that session and retries automatically with exponential delay capped at 30 seconds. Restore disk availability; no client request is required to trigger recovery. Cleanup failures are logged as `Strict session cleanup failed`. Poll activity remains in memory without a per-poll fsync; delivery progress is checkpointed best-effort and may be replayed after restart if a checkpoint failed. L2 hydration is independent of metadata disk availability. Requests allow up to one second for initial directory synchronization, then return 503 if still fenced; a queued recovery checkpoint survives that request timeout. Keep strict metadata on a durable local filesystem supporting atomic rename and directory fsync.
+
+Old binaries skip v3 rather than weakening verification. Preserve v3 files during rollback and restore them only to a compatible server. A missing session response is not proof that client keys may be deleted. Retain original strict proof until explicit local purge; the server does not recover lost keys. The follow-up client releases specify Bash storage using complete atomic installation without a new fsync helper and accepts abrupt host/power-loss risk; Node MCP will keep file/directory sync. This server PR does not release those client changes. Do not publish releases automatically as part of implementation.

@@ -182,14 +182,20 @@ async function handleLeave(
   }
   const sessionId = resolveAlias(rawId);
   const display = rawId !== sessionId ? `${rawId} (${sessionId})` : sessionId;
-  serviceLoop.removeSession(sessionId);
-  removeAlias(sessionId);
+  const strict = runtime.isVerified?.(sessionId) === true;
+  if (!strict) { serviceLoop.removeSession(sessionId); removeAlias(sessionId); }
+  let resume: (() => void) | undefined;
   try {
+    if (strict) resume = await serviceLoop.pauseSession(sessionId);
     const result = await runtime.leave(sessionId);
+    if (strict) {
+      if (!result.ok) return { text: "❌ Strict leave was not confirmed; participation retained" };
+      serviceLoop.removeSession(sessionId); removeAlias(sessionId);
+    }
     return { text: result.ok ? `✅ Left session ${display}` : `⚠️ Left session ${display} (stopped polling, but server leave failed)` };
   } catch (err: unknown) {
-    return { text: `⚠️ Left session ${display} (stopped polling, server: ${formatError(err)})` };
-  }
+    return { text: strict ? `❌ ${formatError(err)}; participation retained` : `⚠️ Left session ${display} (stopped polling, server: ${formatError(err)})` };
+  } finally { resume?.(); }
 }
 
 async function handlePoll(

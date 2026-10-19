@@ -10,7 +10,7 @@ export function computeRenewalThreshold(pollIntervalMs: number): number {
 
 export function isTerminalRenewError(err: unknown): boolean {
   if (err instanceof RuntimeError) {
-    return err.code === "session-expired" || err.code === "agent-not-in-session";
+    return ["session-expired", "agent-not-in-session", "authentication", "server-binding-mismatch", "verification-mode-mismatch", "capacity"].includes(err.code);
   }
   return false;
 }
@@ -175,6 +175,7 @@ export interface ServiceLoop {
   getHealth(): ServiceHealth;
   addSession(sessionId: string): void;
   removeSession(sessionId: string): void;
+  pauseSession(sessionId: string): Promise<() => void>;
   forcePoll(sessionId?: string): Promise<ForcePollResult>;
 }
 
@@ -194,8 +195,38 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
   const healthFile = buildHealthFilePath(config.agentName);
   let loopState: ServiceLoopState = "idle";
   const trackers = new Map<string, SessionTracker>();
+  const paused = new Map<string, number>();
+  const inFlight = new Map<string, Set<Promise<unknown>>>();
+  const pendingDelivery = new Map<string, { tracker: SessionTracker; messages: Map<string, Message> }>();
   let loopTimerId: ReturnType<typeof setInterval> | null = null;
   let currentCycle: number = 0;
+
+  async function track<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+    const pending = Promise.resolve().then(operation);
+    const work = inFlight.get(sessionId) ?? new Set<Promise<unknown>>();
+    work.add(pending); inFlight.set(sessionId, work);
+    try { return await pending; }
+    finally { work.delete(pending); if (!work.size) inFlight.delete(sessionId); }
+  }
+
+  function retainMessages(sessionId: string, tracker: SessionTracker, messages: Message[]): void {
+    const pending = pendingDelivery.get(sessionId) ?? { tracker, messages: new Map<string, Message>() };
+    for (const message of messages) pending.messages.set(message.id, message);
+    pendingDelivery.set(sessionId, pending);
+  }
+
+  function deliverBatch(batch: Map<string, Message[]>): void {
+    const ready = new Map<string, Message[]>();
+    for (const [sessionId, messages] of batch) {
+      const tracker = trackers.get(sessionId);
+      if (!tracker) continue;
+      if (paused.has(sessionId)) retainMessages(sessionId, tracker, messages);
+      else ready.set(sessionId, messages);
+    }
+    if (!ready.size) return;
+    try { config.onMessage(ready); }
+    catch (error) { console.error("[nexus-messaging] onMessage callback error:", error); }
+  }
 
   function buildSessionsSnapshot(): Record<string, SessionHealth> {
     const sessions: Record<string, SessionHealth> = {};
@@ -212,27 +243,34 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
 
   async function pollOne(sessionId: string): Promise<{ sessionId: string; messages: Message[] }> {
     const tracker = trackers.get(sessionId);
-    if (!tracker) return { sessionId, messages: [] };
+    if (!tracker || paused.has(sessionId)) return { sessionId, messages: [] };
 
     tracker.state = "polling";
-    const result = await config.runtime.poll(sessionId, tracker.cursor);
-    tracker.lastPollAt = new Date().toISOString();
-    tracker.cursor = result.nextCursor;
-    tracker.consecutiveErrors = 0;
-    tracker.state = "polling";
+    return track(sessionId, async () => {
+      const result = await config.runtime.poll(sessionId, tracker.cursor);
+      if (trackers.get(sessionId) !== tracker) return { sessionId, messages: [] };
+      tracker.lastPollAt = new Date().toISOString();
+      tracker.cursor = result.nextCursor;
+      tracker.consecutiveErrors = 0;
+      tracker.state = "polling";
 
-    // Post-poll expiry estimation: if messages were received and TTL is known,
-    // the server has reset the sliding window, so estimate new expiresAt
-    if (result.messages.length > 0 && tracker.ttl !== null) {
-      tracker.expiresAt = new Date(Date.now() + tracker.ttl * 1000);
-    }
+      // Post-poll expiry estimation: if messages were received and TTL is known,
+      // the server has reset the sliding window, so estimate new expiresAt
+      if (result.messages.length > 0 && tracker.ttl !== null) {
+        tracker.expiresAt = new Date(Date.now() + tracker.ttl * 1000);
+      }
 
-    return { sessionId, messages: result.messages };
+      if (paused.has(sessionId)) {
+        retainMessages(sessionId, tracker, result.messages);
+        return { sessionId, messages: [] };
+      }
+      return { sessionId, messages: result.messages };
+    });
   }
 
   async function handlePollError(sessionId: string, err: unknown): Promise<void> {
     const tracker = trackers.get(sessionId);
-    if (!tracker) return;
+    if (!tracker || paused.has(sessionId)) return;
     tracker.consecutiveErrors++;
     tracker.lastPollAt = new Date().toISOString();
 
@@ -245,7 +283,8 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
         `[nexus-messaging] Session ${sessionId} error (${err.code}), attempting auto-rejoin`
       );
       try {
-        const rejoinResult = await config.runtime.join(sessionId);
+        const rejoinResult = await track(sessionId, () => config.runtime.join(sessionId));
+        if (trackers.get(sessionId) !== tracker) return;
         tracker.cursor = undefined;
         tracker.consecutiveErrors = 0;
         tracker.state = "polling";
@@ -283,9 +322,9 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
     // sentinel is written to prevent a tight retry loop on every subsequent tick.
     const now = Date.now();
     for (const [sid, tracker] of trackers) {
-      if (tracker.state === "stopped" || tracker.state === "joining") continue;
+      if (paused.has(sid) || tracker.state === "stopped" || tracker.state === "joining") continue;
 
-      const outcome = await attemptRenewal(config.runtime, sid, tracker, now, config.pollIntervalMs);
+      const outcome = await track(sid, () => attemptRenewal(config.runtime, sid, tracker, now, config.pollIntervalMs));
       if (outcome.attempted && !outcome.renewed) {
         console.warn(
           `[nexus-messaging] Renewal failed for session ${sid} (will still attempt poll):`,
@@ -298,7 +337,7 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
     // by a successful renew are included in the same tick's poll pass.
     const eligible: string[] = [];
     for (const [sessionId, tracker] of trackers) {
-      if (tracker.skipUntilCycle <= cycle && tracker.state !== "stopped" && tracker.state !== "joining") {
+      if (!paused.has(sessionId) && tracker.skipUntilCycle <= cycle && tracker.state !== "stopped" && tracker.state !== "joining") {
         eligible.push(sessionId);
       }
     }
@@ -327,16 +366,7 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
       }
     }
 
-    if (batch.size > 0) {
-      try {
-        config.onMessage(batch);
-      } catch (cbErr: unknown) {
-        console.error(
-          `[nexus-messaging] onMessage callback error:`,
-          cbErr
-        );
-      }
-    }
+    deliverBatch(batch);
 
     persistHealth(healthFile, { state: loopState, sessions: buildSessionsSnapshot() });
   }
@@ -351,7 +381,7 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
       }
 
       Promise.allSettled(
-        config.sessions.map((sid) => config.runtime.join(sid))
+        config.sessions.map((sid) => track(sid, () => config.runtime.join(sid)))
       ).then((results) => {
         for (let i = 0; i < results.length; i++) {
           const tracker = trackers.get(config.sessions[i]);
@@ -393,13 +423,14 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
     },
 
     addSession(sessionId: string): void {
-      if (trackers.has(sessionId)) return;
+      if (trackers.has(sessionId) || paused.has(sessionId)) return;
       const tracker = newTracker();
       trackers.set(sessionId, tracker);
 
       if (loopState === "running") {
         tracker.state = "joining";
-        config.runtime.join(sessionId).then((result) => {
+        track(sessionId, () => config.runtime.join(sessionId)).then((result) => {
+          if (trackers.get(sessionId) !== tracker) return;
           tracker.state = "polling";
           if (result.expiresAt) {
             tracker.expiresAt = new Date(result.expiresAt);
@@ -416,7 +447,28 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
 
     removeSession(sessionId: string): void {
       trackers.delete(sessionId);
+      pendingDelivery.delete(sessionId);
       persistHealth(healthFile, { state: loopState, sessions: buildSessionsSnapshot() });
+    },
+
+    async pauseSession(sessionId: string): Promise<() => void> {
+      paused.set(sessionId, (paused.get(sessionId) ?? 0) + 1);
+      // Drain existing polls/renewals/joins; no new background work can start.
+      while (inFlight.get(sessionId)?.size) await Promise.allSettled([...inFlight.get(sessionId)!]);
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        const count = (paused.get(sessionId) ?? 1) - 1;
+        if (count) { paused.set(sessionId, count); return; }
+        paused.delete(sessionId);
+        const pending = pendingDelivery.get(sessionId);
+        pendingDelivery.delete(sessionId);
+        if (pending && trackers.get(sessionId) === pending.tracker && pending.messages.size) {
+          try { config.onMessage(new Map([[sessionId, [...pending.messages.values()]]])); }
+          catch (error) { console.error("[nexus-messaging] onMessage callback error:", error); }
+        }
+      };
     },
 
     async forcePoll(sessionId?: string): Promise<ForcePollResult> {
@@ -444,7 +496,7 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
       // Filter out sessions still joining (join not yet completed)
       const ready = targets.filter((sid) => {
         const t = trackers.get(sid);
-        return t && t.state !== "joining";
+        return t && !paused.has(sid) && t.state !== "joining";
       });
 
       if (ready.length === 0) {
@@ -474,16 +526,7 @@ export function createServiceLoop(config: ServiceLoopConfig): ServiceLoop {
         }
       }
 
-      if (batch.size > 0) {
-        try {
-          config.onMessage(batch);
-        } catch (cbErr: unknown) {
-          console.error(
-            `[nexus-messaging] onMessage callback error:`,
-            cbErr
-          );
-        }
-      }
+      deliverBatch(batch);
 
       return { polled, messagesReceived };
     },

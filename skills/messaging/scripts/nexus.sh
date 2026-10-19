@@ -7,7 +7,7 @@ umask 077
 [[ -d "$HOME/.config/messaging" ]] && chmod -R go-rwx "$HOME/.config/messaging" 2>/dev/null || true
 
 # NexusMessaging CLI wrapper
-# Usage: nexus.sh <command> [args] [--url URL] [--agent-id ID] [--ttl N] [--after CURSOR] [--members]
+# Usage: nexus.sh <command> [args] [--verified-only] [--url URL] [--agent-id ID] [--ttl N] [--after CURSOR] [--members]
 #
 # stdout: JSON only (pipeable to jq)
 # stderr: human-readable tips, status messages
@@ -23,10 +23,10 @@ NEXUS_CAPS_FILE="${HOME}/.config/messaging/server-caps.json"
 NEXUS_CONFIG_FILE="${HOME}/.config/messaging/config.json"
 
 # Normalize a server URL for storage + comparison: lowercase scheme + host[:port],
-# strip a trailing slash. ponytail: no default-port folding (:80/:443) — base URLs
-# never carry it; add it here if a divergence check ever proves too literal.
+# strip trailing slashes and fold the default HTTP(S) ports.
 normalize_url() {
-  local url="${1%/}"
+  local url="$1"
+  while [[ "$url" == */ ]]; do url="${url%/}"; done
   if [[ "$url" != *"://"* ]]; then
     # Scheme-less input (e.g. "messaging.md"): lowercase the authority, keep any
     # path, and leave the scheme for curl to default — matches the pre-config
@@ -41,6 +41,8 @@ normalize_url() {
   local authority="${rest%%/*}"
   scheme=$(printf '%s' "$scheme" | tr '[:upper:]' '[:lower:]')
   authority=$(printf '%s' "$authority" | tr '[:upper:]' '[:lower:]')
+  [[ "$scheme" != http || "$authority" != *:80 ]] || authority="${authority%:80}"
+  [[ "$scheme" != https || "$authority" != *:443 ]] || authority="${authority%:443}"
   printf '%s://%s%s\n' "$scheme" "$authority" "$path"
 }
 
@@ -93,6 +95,8 @@ net_preamble() {
 # wrong-server miss into a right-server hit. Never fails — warnings only.
 route_session_server() {
   local sid="$1"
+  strict_lookup "$sid"
+  [[ "$STRICT_SESSION" != true ]] || return 0
   local f="$NEXUS_DATA_DIR/$sid/server" bound=""
   [[ -f "$f" ]] && bound=$(normalize_url "$(cat "$f")")
   if [[ -n "$URL_FLAG" ]]; then
@@ -117,6 +121,7 @@ route_session_server() {
 # TOFU: adopt the effective server as the binding after a successful (2xx) call.
 # Only ever reached post-success (emit_response exits 1 first on failure).
 adopt_binding_if_unbound() {
+  [[ "$STRICT_SESSION" != true ]] || return 0
   local sid="$1"
   local f="$NEXUS_DATA_DIR/$sid/server"
   [[ -d "$NEXUS_DATA_DIR/$sid" ]] || return 0
@@ -128,8 +133,7 @@ adopt_binding_if_unbound() {
 # Record the session→server binding on acquisition (create/join/claim).
 write_binding() {
   local sid="$1"
-  mkdir -p "$NEXUS_DATA_DIR/$sid"
-  echo "$NEXUS_URL" > "$NEXUS_DATA_DIR/$sid/server"
+  strict_atomic "$NEXUS_DATA_DIR/$sid/server" "$NEXUS_URL" || strict_error local_state_error
 }
 
 # Resolve alias → session ID (or pass through if not an alias)
@@ -170,6 +174,7 @@ remove_alias() {
 # Called only when the server confirms we're no longer a member.
 cleanup_leave_state() {
   local sid="$1" alias_name="$2"
+  if [[ "$STRICT_SESSION" == true && -f "$NEXUS_DATA_DIR/$sid/agent" && "$(cat "$NEXUS_DATA_DIR/$sid/agent")" != "$AGENT_ID" ]]; then return 0; fi
   rm -rf "$NEXUS_DATA_DIR/$sid"
   if [[ -n "$alias_name" ]]; then
     remove_alias "$alias_name"
@@ -184,14 +189,20 @@ cleanup_leave_state() {
 
 # HTTP request helper: preserves error body on failure
 # Usage: http_request [curl args...]
-# Sets RESPONSE and HTTP_OK (true/false)
+# Sets RESPONSE, HTTP_STATUS and HTTP_OK (true for 2xx only)
 http_request() {
-  local exit_code=0
+  local exit_code=0 raw
   # Bound every request: poll is not long-poll (server returns immediately), so
   # no legit call holds the connection open. Prevents poll-all from hanging on a
   # wedged server once it started polling unreachable sessions. Tunable for slow nets.
-  RESPONSE=$(curl -s --fail-with-body --max-time "${NEXUS_HTTP_TIMEOUT:-10}" "$@") || exit_code=$?
-  if [[ $exit_code -ne 0 ]]; then
+  if [[ -n "${AUTH_KEY:-}" ]]; then
+    raw=$(curl -s --fail-with-body --max-time "${NEXUS_HTTP_TIMEOUT:-10}" -w $'\n%{http_code}' -H "X-Session-Key: $AUTH_KEY" "$@") || exit_code=$?
+  else
+    raw=$(curl -s --fail-with-body --max-time "${NEXUS_HTTP_TIMEOUT:-10}" -w $'\n%{http_code}' "$@") || exit_code=$?
+  fi
+  HTTP_STATUS="${raw##*$'\n'}"
+  RESPONSE="${raw%$'\n'*}"
+  if [[ $exit_code -ne 0 || "$HTTP_STATUS" != 2?? ]]; then
     HTTP_OK=false
   else
     HTTP_OK=true
@@ -202,6 +213,9 @@ http_request() {
 # When RESPONSE is not valid JSON (transport failure / proxy HTML),
 # emit a synthetic JSON error to stdout instead of raw output.
 emit_response() {
+  if [[ "$CMD" == renew && -n "${AUTH_KEY:-}" ]]; then
+    RESPONSE=${RESPONSE//"$AUTH_KEY"/"[redacted]"}
+  fi
   if [[ "$HTTP_OK" == "true" ]]; then
     echo "$RESPONSE"
   else
@@ -219,42 +233,302 @@ emit_response() {
   fi
 }
 
-# Resolve the server's supported message formats, with a 5-minute disk cache.
-# stdout: space-separated list of supported formats (e.g. "text json").
-# On any cache miss / unreadable cache / health failure, returns "text" only
-# (conservative: assume the server does NOT support json).
+# Validate the complete capability map before extracting one advertised value.
+extract_server_capability() {
+  jq -er --arg key "$1" '
+    select(type == "object" and
+      (.capabilities == null or
+        (.capabilities | type == "object" and
+          all(.[]; type == "array" and all(.[]; type == "string")))))
+    | (.capabilities[$key] // []) | join(" ")
+  '
+}
+
+# Resolve an advertised capability with a 5-minute disk cache.
+# Missing messageFormat falls back to text; other missing capabilities are empty.
 get_server_capability() {
-  local now fetched_at age formats health_resp
+  local key="${1:-messageFormat}" fallback="" now fetched_at age formats cached_server
+  local health_raw health_resp health_status exit_code=0
+  [[ "$key" == "messageFormat" ]] && fallback="text"
   now=$(date +%s)
 
-  # 1. Use fresh disk cache (TTL 300s)
+  # 1. Use fresh disk cache for this server only (TTL 300s)
   if [[ -f "$NEXUS_CAPS_FILE" ]]; then
+    cached_server=$(jq -r '.serverUrl // empty' "$NEXUS_CAPS_FILE" 2>/dev/null || true)
     fetched_at=$(jq -r '.fetchedAt // empty' "$NEXUS_CAPS_FILE" 2>/dev/null || true)
-    if [[ "$fetched_at" =~ ^[0-9]+$ ]]; then
+    if [[ "$cached_server" == "$NEXUS_URL" && "$fetched_at" =~ ^[0-9]+$ ]]; then
       age=$(( now - fetched_at ))
-      if (( age < 300 )); then
-        jq -r '(.capabilities.messageFormat // []) | join(" ")' "$NEXUS_CAPS_FILE" 2>/dev/null || true
+      if (( age >= 0 && age < 300 )) &&
+          formats=$(extract_server_capability "$key" < "$NEXUS_CAPS_FILE" 2>/dev/null); then
+        printf '%s\n' "${formats:-$fallback}"
         return 0
       fi
     fi
   fi
 
   # 2. Cache miss or stale — query the health endpoint
-  health_resp=$(curl -s --max-time 5 "$NEXUS_URL/health" 2>/dev/null || true)
-  formats=$(jq -r '(.capabilities.messageFormat // []) | join(" ")' <<<"$health_resp" 2>/dev/null || true)
-
-  if [[ -n "$formats" ]]; then
-    # 3. Persist the capabilities object with a fetchedAt timestamp
+  health_raw=$(curl -s --max-time 5 -w $'\n%{http_code}' "$NEXUS_URL/health" 2>/dev/null) || exit_code=$?
+  health_status="${health_raw##*$'\n'}"
+  health_resp="${health_raw%$'\n'*}"
+  if [[ $exit_code -eq 0 && "$health_status" == 2?? ]] &&
+      formats=$(extract_server_capability "$key" <<<"$health_resp" 2>/dev/null); then
+    # 3. Persist successful discovery, including an absent capability.
     mkdir -p "$(dirname "$NEXUS_CAPS_FILE")"
-    jq -c --argjson now "$now" '{capabilities, fetchedAt: $now}' <<<"$health_resp" > "$NEXUS_CAPS_FILE" 2>/dev/null || true
-    printf '%s\n' "$formats"
+    jq -c --argjson now "$now" --arg server "$NEXUS_URL" '{capabilities, fetchedAt: $now, serverUrl: $server}' <<<"$health_resp" > "$NEXUS_CAPS_FILE" 2>/dev/null || true
+    printf '%s\n' "${formats:-$fallback}"
     return 0
   fi
 
-  # 4. Conservative fallback: assume the server does not support json
-  printf 'text\n'
-  return 0
+  # Keep legacy send --json fallback; webhook discovery failures are errors.
+  if [[ "$key" == "messageFormat" ]]; then
+    printf '%s\n' "$fallback"
+    return 0
+  fi
+  return 1
 }
+# Strict credentials are immutable records shared with the Node MCP client.
+# Complete files are closed before no-replace installation; Bash requires no fsync helper.
+STRICT_SESSION=false
+STRICT_KEY=""
+STRICT_RECORD=""
+AUTH_KEY=""
+strict_error() {
+  jq -cn --arg error "$1" '{error:$error}'
+  exit 1
+}
+strict_hash() {
+  if command -v sha256sum >/dev/null 2>&1; then printf '%s' "$1" | sha256sum | cut -d ' ' -f 1
+  else printf '%s' "$1" | shasum -a 256 | cut -d ' ' -f 1; fi
+}
+strict_validate_ids() {
+  [[ "$1" =~ ^[a-fA-F0-9]{48}$ && "$2" =~ ^[a-zA-Z0-9._-]{1,128}$ && "$2" != . && "$2" != .. ]] || strict_error invalid_request
+}
+strict_path() {
+  strict_validate_ids "$1" "$2"
+  printf '%s/identities/%s/%s/%s.json\n' "${NEXUS_DATA_DIR%/sessions}" "$(strict_hash "$NEXUS_URL")" "$1" "$2"
+}
+strict_atomic() {
+  local target="$1" value="$2" temp
+  [[ ! -d "$target" && ! -L "$target" ]] || return 1
+  mkdir -p "$(dirname "$target")" || return 1
+  temp=$(mktemp "${target}.tmp.XXXXXX") || return 1
+  if ! printf '%s\n' "$value" > "$temp" || ! chmod 600 "$temp" || ! mv -f "$temp" "$target"; then rm -f "$temp"; return 1; fi
+}
+strict_install() {
+  local target="$1" value="$2" temp
+  mkdir -p "$(dirname "$target")" || strict_error local_state_error
+  temp=$(mktemp "${target}.tmp.XXXXXX") || strict_error local_state_error
+  if ! printf '%s\n' "$value" > "$temp" || ! chmod 600 "$temp"; then rm -f "$temp"; strict_error local_state_error; fi
+  if ! ln "$temp" "$target" 2>/dev/null; then
+    [[ -f "$target" && ! -L "$target" ]] || { rm -f "$temp"; strict_error local_state_error; }
+  fi
+  rm -f "$temp"
+  STRICT_RECORD="$target"
+}
+strict_use() {
+  local target="$1" sid="$2" agent="$3" code="${4:-}"
+  [[ -f "$target" && ! -L "$target" ]] || strict_error local_state_error
+  STRICT_KEY=$(jq -er --arg server "$NEXUS_URL" --arg sid "$sid" --arg agent "$agent" --arg code "$code" '
+    select(.v==1 and .verifiedOnly==true and .serverUrl==$server and .sessionId==$sid and .agentId==$agent and (.code // "")==$code)
+    | .sessionKey | select(type=="string" and test("^[a-f0-9]{64}$"))' "$target") || strict_error local_state_error
+  STRICT_RECORD="$target"; AUTH_KEY="$STRICT_KEY"; STRICT_SESSION=true
+}
+strict_allocate() {
+  [[ "$3" =~ ^[a-zA-Z0-9._-]{1,128}$ && "$3" != . && "$3" != .. ]] || strict_error invalid_request
+  local target="$1" sid="$2" agent="$3" code="${4:-}" proposal value
+  if [[ ! -e "$target" ]]; then
+    proposal=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
+    [[ "$proposal" =~ ^[a-f0-9]{64}$ ]] || strict_error local_state_error
+    value=$(jq -cn --arg server "$NEXUS_URL" --arg sid "$sid" --arg agent "$agent" --arg key "$proposal" --arg code "$code" \
+      '{v:1,serverUrl:$server,sessionId:$sid,agentId:$agent,verifiedOnly:true,sessionKey:$key} + (if $code=="" then {} else {code:$code} end)')
+    strict_install "$target" "$value"
+  fi
+  strict_use "$target" "$sid" "$agent" "$code"
+}
+strict_admission_path() {
+  local kind="$1" target="$2" agent="$3" component
+  [[ "$agent" =~ ^[a-zA-Z0-9._-]{1,128}$ && "$agent" != . && "$agent" != .. ]] || strict_error invalid_request
+  if [[ "$kind" == join ]]; then strict_validate_ids "$target" "$agent"; component="join-$target"
+  else component=$(strict_hash "$target"); fi
+  printf '%s/admissions/%s/%s/%s.json\n' "${NEXUS_DATA_DIR%/sessions}" "$(strict_hash "$NEXUS_URL")" "$component" "$agent"
+}
+strict_prepare_join() {
+  local sid="$1" agent="$2" identity
+  identity=$(strict_path "$sid" "$agent")
+  if [[ -f "$identity" ]]; then strict_use "$identity" "$sid" "$agent"; return; fi
+  ADMISSION_RECORD=$(strict_admission_path join "$sid" "$agent")
+  strict_allocate "$ADMISSION_RECORD" "$sid" "$agent"
+  # Promotion may have raced this allocation; an accepted identity always wins.
+  if [[ -f "$identity" ]]; then strict_use "$identity" "$sid" "$agent"; fi
+}
+strict_save_policy() {
+  local sid="$1"
+  [[ "$sid" =~ ^[a-fA-F0-9]{48}$ ]] || strict_error invalid_request
+  strict_atomic "${NEXUS_DATA_DIR%/sessions}/policies/$(strict_hash "$NEXUS_URL")/$sid.json" "$(jq -cn --arg server "$NEXUS_URL" --arg sid "$sid" '{v:1,serverUrl:$server,sessionId:$sid,verifiedOnly:true}')" || strict_error local_state_error
+}
+# Policy chooses a destination; only a confirmed tuple can supply member proof.
+# Public operations deliberately do not require or transmit a key.
+strict_lookup() {
+  local sid="$1" root="${NEXUS_DATA_DIR%/sessions}" file records='[]' policies='[]' info
+  local active_agent="" active_server="" active_policy=false agent="${AGENT_ID:-}" servers count selected="" bound=""
+  local files=() policy_files=()
+  STRICT_SESSION=false; STRICT_KEY=""; STRICT_RECORD=""; AUTH_KEY=""
+  if [[ -f "$NEXUS_DATA_DIR/$sid/policy" && "$(cat "$NEXUS_DATA_DIR/$sid/policy")" == verifiedOnly ]]; then
+    active_policy=true
+    active_agent=$(cat "$NEXUS_DATA_DIR/$sid/agent" 2>/dev/null || true)
+    active_server=$(cat "$NEXUS_DATA_DIR/$sid/server" 2>/dev/null || true)
+    [[ -z "$active_server" ]] || active_server=$(normalize_url "$active_server")
+    [[ -n "$agent" ]] || agent="$active_agent"
+  fi
+  for file in "$root"/identities/*/"$sid"/*.json; do
+    [[ ! -L "$file" ]] || strict_error local_state_error
+    [[ ! -f "$file" ]] || files+=("$file")
+  done
+  for file in "$root"/policies/*/"$sid.json"; do
+    [[ ! -L "$file" ]] || strict_error local_state_error
+    [[ ! -f "$file" ]] || policy_files+=("$file")
+  done
+  if [[ ${#files[@]} -gt 0 ]]; then
+    records=$(jq -ec --arg sid "$sid" '[inputs | . + {path:input_filename} | select(.v==1 and .verifiedOnly==true and .sessionId==$sid and (.agentId|type=="string" and test("^(?!\\.{1,2}$)[a-zA-Z0-9._-]{1,128}$")) and (.serverUrl|type=="string") and (.sessionKey|type=="string" and test("^[a-f0-9]{64}$")))]' -n "${files[@]}") || strict_error local_state_error
+    [[ "$(jq 'length' <<<"$records")" -eq ${#files[@]} ]] || strict_error local_state_error
+  fi
+  if [[ ${#policy_files[@]} -gt 0 ]]; then
+    policies=$(jq -ecn --arg sid "$sid" '[inputs | . + {path:input_filename} | select(.v==1 and .verifiedOnly==true and .sessionId==$sid and (.serverUrl|type=="string"))]' "${policy_files[@]}") || strict_error local_state_error
+    [[ "$(jq 'length' <<<"$policies")" -eq ${#policy_files[@]} ]] || strict_error local_state_error
+  fi
+  if [[ ${#files[@]} -eq 0 && ${#policy_files[@]} -eq 0 && "$active_policy" == false ]]; then return 0; fi
+  STRICT_SESSION=true
+  # Agent-specific records take priority. Session policy covers public operations
+  # and first admission of another agent without borrowing anyone else's key.
+  servers=$(jq -c --arg agent "$agent" --argjson policies "$policies" '
+    [.[] | select($agent=="" or .agentId==$agent)] as $matching |
+    (if ($matching|length)>0 then $matching else . + $policies end) | map(.serverUrl) | unique' <<<"$records")
+  if [[ "$servers" == '[]' && -n "$active_server" ]]; then servers=$(jq -cn --arg server "$active_server" '[$server]'); fi
+  count=$(jq 'length' <<<"$servers")
+  if [[ "$count" -eq 0 ]]; then strict_error local_state_error; fi
+  if [[ "$active_policy" == true && -n "$active_server" ]] && {
+    jq -e --arg server "$active_server" 'index($server)!=null' <<<"$servers" >/dev/null ||
+    jq -e --arg server "$active_server" 'any(.[]; .serverUrl==$server)' <<<"$policies" >/dev/null;
+  }; then
+    bound="$active_server"
+    [[ -z "$URL_FLAG" || "$URL_FLAG" == "$bound" ]] || strict_error server_binding_mismatch
+  elif [[ -n "$URL_FLAG" ]]; then
+    jq -e --arg server "$URL_FLAG" 'index($server)!=null' <<<"$servers" >/dev/null || strict_error server_binding_mismatch
+    bound="$URL_FLAG"
+  else
+    [[ "$count" -eq 1 ]] || strict_error ambiguous_server_binding
+    bound=$(jq -r '.[0]' <<<"$servers")
+  fi
+  [[ "$bound" =~ ^https?://[^/?#@]+(/[^?#]*)?$ && "$(normalize_url "$bound")" == "$bound" ]] || strict_error local_state_error
+  NEXUS_URL="$bound"; SERVER_SOURCE="session binding"
+  # A hash identifies a path; validate it against the recorded destination too.
+  if [[ ${#policy_files[@]} -gt 0 ]]; then
+    local expected_policy="$root/policies/$(strict_hash "$bound")/$sid.json"
+    jq -e --arg server "$bound" --arg path "$expected_policy" 'all(.[] | select(.serverUrl==$server); .path==$path)' <<<"$policies" >/dev/null || strict_error local_state_error
+  fi
+  selected=$(jq -c --arg agent "$agent" --arg server "$bound" '[.[] | select(.serverUrl==$server and ($agent=="" or .agentId==$agent))]' <<<"$records")
+  count=$(jq 'length' <<<"$selected")
+  if [[ "$count" -eq 1 ]]; then
+    info=$(jq -r '.[0] | [.agentId,.path] | @tsv' <<<"$selected")
+    local record_agent record_path
+    IFS=$'\t' read -r record_agent record_path <<<"$info"
+    [[ "$record_path" == "$(strict_path "$sid" "$record_agent")" ]] || strict_error local_state_error
+    strict_use "$record_path" "$sid" "$record_agent"
+    AGENT_ID="$record_agent"
+  fi
+  case "$CMD" in
+    send|poll|renew|leave)
+      [[ -n "$agent" || "$count" -eq 1 ]] || strict_error missing_agent_id
+      [[ "$count" -eq 1 ]] || strict_error missing_session_key
+      ;;
+    join)
+      # A known active identity with its authoritative proof purged cannot be
+      # safely replaced by a newly generated key. Public status stays usable.
+      if [[ "$count" -eq 0 && "$active_policy" == true && "$agent" == "$active_agent" && ! -f "$(strict_admission_path join "$sid" "$agent")" ]]; then strict_error missing_session_key; fi
+      ;;
+    *) AUTH_KEY="" ;;
+  esac
+}
+strict_confirm() {
+  [[ "$HTTP_OK" == true ]] || return 0
+  if [[ "$STRICT_SESSION" == true && "$(jq -r '.verifiedOnly // false' <<<"$RESPONSE")" != true ]]; then strict_error verification_mode_mismatch; fi
+}
+strict_cursor_file() {
+  printf '%s/cursors/%s/%s/%s.cursor' "${NEXUS_DATA_DIR%/sessions}" "$(strict_hash "$NEXUS_URL")" "$SESSION_ID" "$AGENT_ID"
+}
+strict_cursor_greater() {
+  local LC_ALL=C
+  [[ ${#1} -gt ${#2} || ( ${#1} -eq ${#2} && "$1" > "$2" ) ]]
+}
+strict_cursor_read() {
+  local file marker value best="" dir
+  file=$(strict_cursor_file); dir="$file.d"
+  if [[ -f "$file" ]]; then
+    value=$(cat "$file") || return 1
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    best=$(sed 's/^0*//;s/^$/0/' <<<"$value")
+  fi
+  for marker in "$dir"/*; do
+    [[ -d "$marker" && ! -L "$marker" ]] || continue
+    value=${marker##*/}
+    [[ "$value" =~ ^(0|[1-9][0-9]*)$ ]] || continue
+    if [[ -z "$best" ]] || strict_cursor_greater "$value" "$best"; then best="$value"; fi
+  done
+  printf '%s' "$best"
+}
+strict_cursor_save() {
+  local value="$1" current dir marker older
+  [[ "$value" =~ ^[0-9]+$ ]] || return 1
+  value=$(sed 's/^0*//;s/^$/0/' <<<"$value")
+  current=$(strict_cursor_read) || return 1
+  if [[ -n "$current" ]] && strict_cursor_greater "$current" "$value"; then value="$current"; fi
+  dir="$(strict_cursor_file).d"
+  mkdir -p "$dir/$value" || return 1
+  # Never remove a value until an equal or greater successor exists.
+  for marker in "$dir"/*; do
+    [[ -d "$marker" && ! -L "$marker" ]] || continue
+    older=${marker##*/}
+    [[ "$older" =~ ^(0|[1-9][0-9]*)$ ]] || continue
+    if strict_cursor_greater "$value" "$older"; then rm -rf -- "$marker" || true; fi
+  done
+}
+strict_save_response() {
+  local sid="$1" agent="$2" file value returned
+  [[ "$(jq -r '.verifiedOnly // false' <<<"$RESPONSE")" == true ]] || return 0
+  [[ -n "$agent" ]] || return 0
+  returned=$(jq -er '.sessionKey' <<<"$RESPONSE") || strict_error invalid_session_key
+  [[ -n "$STRICT_KEY" && "$returned" == "$STRICT_KEY" ]] || strict_error invalid_session_key
+  file=$(strict_path "$sid" "$agent")
+  value=$(jq -cn --arg server "$NEXUS_URL" --arg sid "$sid" --arg agent "$agent" --arg key "$STRICT_KEY" '{v:1,serverUrl:$server,sessionId:$sid,agentId:$agent,verifiedOnly:true,sessionKey:$key}')
+  strict_install "$file" "$value"
+  strict_use "$file" "$sid" "$agent"
+  [[ "$STRICT_KEY" == "$returned" ]] || strict_error credential_conflict
+  strict_save_policy "$sid"
+  if [[ "$(jq -r '.membershipState // "active"' <<<"$RESPONSE")" != inactive ]]; then
+    strict_atomic "$NEXUS_DATA_DIR/$sid/server" "$NEXUS_URL" || strict_error local_state_error
+    strict_atomic "$NEXUS_DATA_DIR/$sid/key" "$STRICT_KEY" || strict_error local_state_error
+    strict_atomic "$NEXUS_DATA_DIR/$sid/agent" "$agent" || strict_error local_state_error
+    strict_atomic "$NEXUS_DATA_DIR/$sid/policy" verifiedOnly || strict_error local_state_error
+  fi
+}
+strict_retry_admission() {
+  local kind="$1" target="$2" mode root="${NEXUS_DATA_DIR%/sessions}" saved="$RESPONSE" saved_status="$HTTP_STATUS" saved_ok="$HTTP_OK" record
+  [[ "$HTTP_OK" != true && "$(jq -r '.error // empty' <<<"$RESPONSE" 2>/dev/null || true)" == missing_session_key ]] || return 0
+  AUTH_KEY=""
+  if [[ "$kind" == join ]]; then http_request "$NEXUS_URL/v1/sessions/$target"
+  else http_request "$NEXUS_URL/v1/pair/$target/status"; fi
+  mode=$(jq -r '.verifiedOnly // false' <<<"$RESPONSE" 2>/dev/null || true)
+  if [[ "$HTTP_OK" != true || "$mode" != true ]]; then RESPONSE="$saved"; HTTP_STATUS="$saved_status"; HTTP_OK="$saved_ok"; return 0; fi
+  if [[ "$kind" == join ]]; then
+    strict_prepare_join "$target" "$AGENT_ID"
+  else
+    record=$(strict_admission_path claim "$target" "$AGENT_ID")
+    strict_allocate "$record" "" "$AGENT_ID" "$target"
+  fi
+  http_request -X POST "$NEXUS_URL/v1/$([[ "$kind" == join ]] && printf sessions || printf pair)/$target/$([[ "$kind" == join ]] && printf join || printf claim)" -H "X-Agent-Id: $AGENT_ID"
+}
+
+VERIFIED_ONLY=false
 AGENT_ID=""
 TTL=""
 AFTER=""
@@ -277,6 +551,7 @@ while [[ $# -gt 0 ]]; do
     --max-agents) MAX_AGENTS="$2"; shift 2 ;;
     --creator-agent-id) CREATOR_AGENT_ID="$2"; shift 2 ;;
     --members) MEMBERS="true"; shift ;;
+    --verified-only) VERIFIED_ONLY=true; shift ;;
     *) POSITIONAL+=("$1"); shift ;;
   esac
 done
@@ -284,6 +559,7 @@ set -- "${POSITIONAL[@]}"
 
 # Resolve the effective server (--url > env > config > default) once, up front.
 resolve_server_url
+[[ -z "$URL_FLAG" ]] || URL_FLAG=$(normalize_url "$URL_FLAG")
 
 CMD="${1:-help}"
 shift || true
@@ -308,6 +584,16 @@ case "$CMD" in
       BODY=$(echo "$BODY" | jq -c --arg creatorAgentId "$CREATOR_AGENT_ID" '. + {creatorAgentId: $creatorAgentId}')
     fi
 
+    if [[ "$VERIFIED_ONLY" == true ]]; then
+      CAPS=$(get_server_capability sessionPolicies) || strict_error verified_only_unsupported
+      [[ " $CAPS " == *" verifiedOnly "* ]] || strict_error verified_only_unsupported
+      STRICT_SESSION=true
+      BODY=$(jq -c '. + {verifiedOnly:true}' <<<"$BODY")
+      if [[ -n "${CREATOR_AGENT_ID:-${AGENT_ID:-}}" ]]; then
+        ATTEMPT="${NEXUS_DATA_DIR%/sessions}/admissions/$(strict_hash "$NEXUS_URL")/create-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n').json"
+        strict_allocate "$ATTEMPT" "" "${CREATOR_AGENT_ID:-$AGENT_ID}"
+      fi
+    fi
     net_preamble
     # --agent-id owns the header, --creator-agent-id owns the body field; the
     # server resolves/validates the two (conflict → creator_identity_conflict).
@@ -321,26 +607,40 @@ case "$CMD" in
         -H "Content-Type: application/json" \
         -d "$BODY"
     fi
-    emit_response
+    if [[ "$HTTP_OK" != true && -n "${ATTEMPT:-}" && "$HTTP_STATUS" == 4?? ]]; then
+      case "$(jq -r '.error // empty' <<<"$RESPONSE" 2>/dev/null || true)" in
+        invalid_request|invalid_body|creator_identity_conflict|missing_session_key|invalid_session_key) rm -f "$ATTEMPT" ;;
+      esac
+    fi
+    strict_confirm
+    if [[ "$HTTP_OK" == true && "$STRICT_SESSION" == true ]]; then
+      STRICT_SID=$(jq -r '.sessionId' <<<"$RESPONSE")
+      strict_save_response "$STRICT_SID" "$(jq -r '.creatorAgentId // empty' <<<"$RESPONSE")"
+      if [[ -z "$(jq -r '.creatorAgentId // empty' <<<"$RESPONSE")" ]]; then
+        strict_save_policy "$STRICT_SID"
+      fi
+      [[ -z "${ATTEMPT:-}" ]] || rm -f "$ATTEMPT"
+    fi
+    [[ "$HTTP_OK" == true ]] || emit_response
 
     # Persistence is response-driven: the server is the authority on whether a
     # creator was registered (body creatorAgentId ?? X-Agent-Id header).
     RESP_CREATOR=$(echo "$RESPONSE" | jq -r '.creatorAgentId // empty')
-    if [[ -n "$RESP_CREATOR" ]]; then
+    if [[ -n "$RESP_CREATOR" && "$STRICT_SESSION" != true ]]; then
       SESSION_ID=$(echo "$RESPONSE" | jq -r '.sessionId // empty')
       if [[ -n "$SESSION_ID" ]]; then
-        mkdir -p "$NEXUS_DATA_DIR/$SESSION_ID"
         write_binding "$SESSION_ID"
         AGENT_FILE="$NEXUS_DATA_DIR/$SESSION_ID/agent"
-        echo "$RESP_CREATOR" > "$AGENT_FILE"
+        strict_atomic "$AGENT_FILE" "$RESP_CREATOR" || strict_error local_state_error
 
         SESSION_KEY=$(echo "$RESPONSE" | jq -r '.sessionKey // empty')
         if [[ -n "$SESSION_KEY" ]]; then
           KEY_FILE="$NEXUS_DATA_DIR/$SESSION_ID/key"
-          echo "$SESSION_KEY" > "$KEY_FILE"
+          strict_atomic "$KEY_FILE" "$SESSION_KEY" || strict_error local_state_error
         fi
       fi
     fi
+    emit_response
     ;;
 
   alias)
@@ -534,6 +834,7 @@ case "$CMD" in
     route_session_server "$SESSION_ID"
     net_preamble
     http_request "$NEXUS_URL/v1/sessions/$SESSION_ID"
+    strict_confirm
     emit_response
     adopt_binding_if_unbound "$SESSION_ID"
     ;;
@@ -542,21 +843,28 @@ case "$CMD" in
     SESSION_ID="${1:?Usage: nexus.sh join <SESSION_ID> --agent-id ID}"
     SESSION_ID=$(resolve_session "$SESSION_ID")
     [[ -z "$AGENT_ID" ]] && echo '{"error":"missing --agent-id"}' && exit 1
+    strict_lookup "$SESSION_ID"
+    [[ "$STRICT_SESSION" != true ]] || strict_prepare_join "$SESSION_ID" "$AGENT_ID"
     net_preamble
     http_request -X POST "$NEXUS_URL/v1/sessions/$SESSION_ID/join" \
       -H "X-Agent-Id: $AGENT_ID"
-    emit_response
+    strict_retry_admission join "$SESSION_ID"
+    strict_confirm
+    [[ "$HTTP_OK" != true ]] || strict_save_response "$SESSION_ID" "$AGENT_ID"
+    [[ "$HTTP_OK" == true ]] || emit_response
 
-    mkdir -p "$NEXUS_DATA_DIR/$SESSION_ID"
-    write_binding "$SESSION_ID"
-    AGENT_FILE="$NEXUS_DATA_DIR/$SESSION_ID/agent"
-    echo "$AGENT_ID" > "$AGENT_FILE"
+    if [[ "$STRICT_SESSION" != true ]]; then
+      write_binding "$SESSION_ID"
+      AGENT_FILE="$NEXUS_DATA_DIR/$SESSION_ID/agent"
+      strict_atomic "$AGENT_FILE" "$AGENT_ID" || strict_error local_state_error
 
-    SESSION_KEY=$(echo "$RESPONSE" | jq -r '.sessionKey // empty')
-    if [[ -n "$SESSION_KEY" ]]; then
-      KEY_FILE="$NEXUS_DATA_DIR/$SESSION_ID/key"
-      echo "$SESSION_KEY" > "$KEY_FILE"
+      SESSION_KEY=$(echo "$RESPONSE" | jq -r '.sessionKey // empty')
+      if [[ -n "$SESSION_KEY" ]]; then
+        KEY_FILE="$NEXUS_DATA_DIR/$SESSION_ID/key"
+        strict_atomic "$KEY_FILE" "$SESSION_KEY" || strict_error local_state_error
+      fi
     fi
+    emit_response
     ;;
 
   pair)
@@ -573,30 +881,43 @@ case "$CMD" in
 
   claim)
     CODE="${1:?Usage: nexus.sh claim <CODE> --agent-id ID}"
+    CODE=$(printf '%s' "$CODE" | tr '[:lower:]' '[:upper:]')
     [[ -z "$AGENT_ID" ]] && echo '{"error":"missing --agent-id"}' && exit 1
 
+    CLAIM_RECORD=""
+    # Unknown/default admission retains server-side validation and its error body.
+    if [[ "$AGENT_ID" =~ ^[a-zA-Z0-9._-]{1,128}$ && "$AGENT_ID" != . && "$AGENT_ID" != .. ]]; then
+      CLAIM_RECORD=$(strict_admission_path claim "$CODE" "$AGENT_ID")
+    fi
+    if [[ -n "$CLAIM_RECORD" && -f "$CLAIM_RECORD" ]]; then strict_allocate "$CLAIM_RECORD" "" "$AGENT_ID" "$CODE"; fi
     net_preamble
     http_request -X POST "$NEXUS_URL/v1/pair/$CODE/claim" \
       -H "X-Agent-Id: $AGENT_ID"
-    emit_response
+    strict_retry_admission claim "$CODE"
+    strict_confirm
+    if [[ "$HTTP_OK" == true && "$STRICT_SESSION" == true ]]; then
+      strict_save_response "$(jq -r '.sessionId' <<<"$RESPONSE")" "$AGENT_ID"
+      if [[ "$(jq -r '.membershipState // "active"' <<<"$RESPONSE")" == inactive ]]; then emit_response; exit 0; fi
+    fi
+    [[ "$HTTP_OK" == true ]] || emit_response
 
     SESSION_ID=$(echo "$RESPONSE" | jq -r '.sessionId // empty')
-    if [[ -n "$SESSION_ID" ]]; then
-      mkdir -p "$NEXUS_DATA_DIR/$SESSION_ID"
+    if [[ -n "$SESSION_ID" && "$STRICT_SESSION" != true ]]; then
       write_binding "$SESSION_ID"
       AGENT_FILE="$NEXUS_DATA_DIR/$SESSION_ID/agent"
-      echo "$AGENT_ID" > "$AGENT_FILE"
+      strict_atomic "$AGENT_FILE" "$AGENT_ID" || strict_error local_state_error
 
       SESSION_KEY=$(echo "$RESPONSE" | jq -r '.sessionKey // empty')
       if [[ -n "$SESSION_KEY" ]]; then
         KEY_FILE="$NEXUS_DATA_DIR/$SESSION_ID/key"
-        echo "$SESSION_KEY" > "$KEY_FILE"
+        strict_atomic "$KEY_FILE" "$SESSION_KEY" || strict_error local_state_error
       fi
 
       echo "" >&2
       echo "✅ Claimed! Next step: poll messages" >&2
       echo "$0 poll $SESSION_ID" >&2
     fi
+    emit_response
     ;;
 
   pair-status)
@@ -662,7 +983,7 @@ case "$CMD" in
         exit 1
       fi
 
-      FORMATS=$(get_server_capability)
+      FORMATS=$(get_server_capability messageFormat)
       if [[ " $FORMATS " == *" json "* ]]; then
         # Server supports native json: { text?, json }
         BODY=$(printf '%s' "$JSON_PAYLOAD" | jq -c --arg text "$TEXT" \
@@ -684,7 +1005,7 @@ case "$CMD" in
     fi
 
     KEY_FILE="$NEXUS_DATA_DIR/$SESSION_ID/key"
-    if [[ -f "$KEY_FILE" ]]; then
+    if [[ -z "$AUTH_KEY" && -f "$KEY_FILE" ]]; then
       http_request -X POST "$NEXUS_URL/v1/sessions/$SESSION_ID/messages" \
         -H "X-Agent-Id: $AGENT_ID" \
         -H "X-Session-Key: $(cat "$KEY_FILE")" \
@@ -716,11 +1037,14 @@ case "$CMD" in
       fi
     fi
 
-    mkdir -p "$NEXUS_DATA_DIR/$SESSION_ID"
+    # Polling a retained identity must not recreate active discovery before admission.
+    if [[ "$STRICT_SESSION" != true ]]; then mkdir -p "$NEXUS_DATA_DIR/$SESSION_ID"; fi
     CURSOR_FILE="$NEXUS_DATA_DIR/$SESSION_ID/cursor"
 
     SAVED_CURSOR=""
-    if [[ -f "$CURSOR_FILE" ]]; then
+    if [[ "$STRICT_SESSION" == true ]]; then
+      SAVED_CURSOR=$(strict_cursor_read) || strict_error local_state_error
+    elif [[ -f "$CURSOR_FILE" ]]; then
       SAVED_CURSOR=$(cat "$CURSOR_FILE")
     fi
 
@@ -747,11 +1071,17 @@ case "$CMD" in
 
     http_request "$NEXUS_URL/v1/sessions/$SESSION_ID/messages$QUERY" \
       -H "X-Agent-Id: $AGENT_ID"
+    if [[ "$STRICT_SESSION" == true && "$HTTP_OK" == true && -z "$AFTER" ]]; then
+      NEXT_CURSOR=$(jq -r '.nextCursor // empty' <<<"$RESPONSE")
+      if ! strict_cursor_save "$NEXT_CURSOR"; then
+        RESPONSE=$(jq '. + {cursorSaved:false,warning:"Local cursor could not be saved; messages may repeat on the next poll."}' <<<"$RESPONSE")
+      fi
+    fi
     emit_response
     adopt_binding_if_unbound "$SESSION_ID"
 
     NEXT_CURSOR=$(echo "$RESPONSE" | jq -r '.nextCursor // empty')
-    if [[ -z "$AFTER" && -n "$NEXT_CURSOR" ]]; then
+    if [[ "$STRICT_SESSION" != true && -z "$AFTER" && -n "$NEXT_CURSOR" && -d "$NEXUS_DATA_DIR/$SESSION_ID" ]]; then
       echo "$NEXT_CURSOR" > "$CURSOR_FILE"
     fi
 
@@ -885,6 +1215,14 @@ case "$CMD" in
       fi
     fi
 
+    if [[ -z "$AUTH_KEY" && "$STRICT_SESSION" != true && -f "$NEXUS_DATA_DIR/$SESSION_ID/key" ]]; then
+      AUTH_KEY=$(cat "$NEXUS_DATA_DIR/$SESSION_ID/key")
+    fi
+    if [[ -z "$AUTH_KEY" ]]; then
+      echo '{"error":"missing_session_key","hint":"Restore the saved credential directory from a persistent volume or backup before renewing. Rejoining an active ID cannot recover its key."}'
+      exit 1
+    fi
+
     BODY=""
     if [[ -n "${TTL:-}" ]]; then
       BODY=$(echo "{}" | jq -c --argjson ttl "$TTL" '. + {ttl: $ttl}')
@@ -933,13 +1271,16 @@ case "$CMD" in
     fi
 
     KEY_FILE="$NEXUS_DATA_DIR/$SESSION_ID/key"
-    if [[ ! -f "$KEY_FILE" ]]; then
+    if [[ ! -f "$KEY_FILE" && -z "$AUTH_KEY" ]]; then
       echo '{"error":"no session key found"}' && exit 1
     fi
 
-    http_request -X DELETE "$NEXUS_URL/v1/sessions/$SESSION_ID/agents/$AGENT_ID" \
-      -H "X-Agent-Id: $AGENT_ID" \
-      -H "X-Session-Key: $(cat "$KEY_FILE")"
+    if [[ -n "$AUTH_KEY" ]]; then
+      http_request -X DELETE "$NEXUS_URL/v1/sessions/$SESSION_ID/agents/$AGENT_ID" -H "X-Agent-Id: $AGENT_ID"
+    else
+      http_request -X DELETE "$NEXUS_URL/v1/sessions/$SESSION_ID/agents/$AGENT_ID" \
+        -H "X-Agent-Id: $AGENT_ID" -H "X-Session-Key: $(cat "$KEY_FILE")"
+    fi
 
     # Parse response — handle potentially non-JSON bodies from proxies
     OK="false"
@@ -960,6 +1301,11 @@ case "$CMD" in
       echo "" >&2
       echo "✅ Left session. Local data cleaned up." >&2
       exit 0
+    fi
+
+    if [[ "$STRICT_SESSION" == true ]]; then
+      echo "Strict leave failed; original proof and participation retained." >&2
+      exit 1
     fi
 
     # 404 session_not_found / agent_not_found — session gone or agent no longer
@@ -1083,13 +1429,17 @@ case "$CMD" in
   bind)
     SESSION_ID="${1:?Usage: nexus.sh bind <SESSION_ID>}"
     SESSION_ID=$(resolve_session "$SESSION_ID")
+    strict_lookup "$SESSION_ID"
     net_preamble
     # Adopt the session only if the EFFECTIVE server actually knows it (200).
     BIND_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time "${NEXUS_HTTP_TIMEOUT:-10}" \
       "$NEXUS_URL/v1/sessions/$SESSION_ID" 2>/dev/null) || BIND_CODE="000"
     if [[ "$BIND_CODE" == "200" ]]; then
-      mkdir -p "$NEXUS_DATA_DIR/$SESSION_ID"
-      echo "$NEXUS_URL" > "$NEXUS_DATA_DIR/$SESSION_ID/server"
+      # Retained strict records already bind the destination; bind is not admission.
+      if [[ "$STRICT_SESSION" != true || -d "$NEXUS_DATA_DIR/$SESSION_ID" ]]; then
+        mkdir -p "$NEXUS_DATA_DIR/$SESSION_ID"
+        strict_atomic "$NEXUS_DATA_DIR/$SESSION_ID/server" "$NEXUS_URL" || strict_error local_state_error
+      fi
       jq -n --arg sid "$SESSION_ID" --arg srv "$NEXUS_URL" '{ok: true, sessionId: $sid, server: $srv}'
       echo "✅ Bound ${SESSION_ID:0:12}… → $NEXUS_URL" >&2
     else
@@ -1198,6 +1548,49 @@ case "$CMD" in
     fi
     ;;
 
+  webhook)
+    ACTION="${1:-}"
+    case "$ACTION" in add|list|rm) ;; *) echo '{"error":"usage: webhook add|list|rm <SESSION> [URL|WEBHOOK_ID]"}'; exit 1 ;; esac
+    SESSION_ID="${2:?Usage: nexus.sh webhook add|list|rm <SESSION> [URL|WEBHOOK_ID]}"
+    SESSION_ID=$(resolve_session "$SESSION_ID")
+    route_session_server "$SESSION_ID"
+    AGENT_FILE="$NEXUS_DATA_DIR/$SESSION_ID/agent"
+    KEY_FILE="$NEXUS_DATA_DIR/$SESSION_ID/key"
+    if [[ ( -z "$AGENT_ID" && ! -s "$AGENT_FILE" ) || ! -s "$KEY_FILE" ]]; then
+      echo '{"error":"missing persisted creator credentials"}'; exit 1
+    fi
+    [[ -n "$AGENT_ID" ]] || AGENT_ID=$(cat "$AGENT_FILE")
+    net_preamble
+    if ! CAPABILITY=$(get_server_capability webhooks); then
+      echo '{"error":"capability_check_failed"}'
+      echo "Could not read server capabilities from $NEXUS_URL/health." >&2
+      exit 1
+    fi
+    if [[ " $CAPABILITY " != *" experimental "* ]]; then
+      echo "This server does not offer Webhooks." >&2
+      echo '{"error":"webhooks_not_supported"}'; exit 1
+    fi
+    ENDPOINT="$NEXUS_URL/v1/sessions/$SESSION_ID/webhooks"
+    AUTH_HEADERS=(-H "X-Agent-Id: $AGENT_ID" -H "X-Session-Key: $(cat "$KEY_FILE")")
+    case "$ACTION" in
+      add)
+        DESTINATION="${3:?Usage: nexus.sh webhook add <SESSION> <URL>}"
+        BODY=$(jq -cn --arg url "$DESTINATION" '{url: $url}')
+        http_request -X PUT "$ENDPOINT" "${AUTH_HEADERS[@]}" -H "Content-Type: application/json" -d "$BODY"
+        ;;
+      list) http_request "$ENDPOINT" "${AUTH_HEADERS[@]}" ;;
+      rm)
+        WEBHOOK_ID="${3:?Usage: nexus.sh webhook rm <SESSION> <WEBHOOK_ID>}"
+        http_request -X DELETE "$ENDPOINT/$WEBHOOK_ID" "${AUTH_HEADERS[@]}"
+        ;;
+    esac
+    emit_response
+    if [[ "$ACTION" == "add" ]]; then
+      echo "Save the webhook secret on the receiving server: it is shown only once and is never saved locally." >&2
+    fi
+    adopt_binding_if_unbound "$SESSION_ID"
+    ;;
+
   help)
     TOPIC="${1:-}"
     case "$TOPIC" in
@@ -1223,6 +1616,20 @@ Aliases resolve client-side. Any command that accepts a SESSION_ID also accepts 
 Storage: ~/.config/messaging/aliases.json
 EOF
         ;;
+      webhook)
+        cat >&2 <<EOF
+Advanced (experimental): Session webhooks
+
+  webhook add <SESSION> <HTTPS_URL>  Register a receiver; save the returned secret
+  webhook list <SESSION>             List delivery status (without secrets)
+  webhook rm <SESSION> <WEBHOOK_ID>   Delete a receiver
+
+Requires a server advertising the webhooks capability and the persisted creator
+agent and session key. Session aliases and server bindings are supported.
+Receiver URLs must use public HTTPS on port 443. The secret is shown once and
+never saved locally. See the server's browser documentation for verification.
+EOF
+        ;;
       *)
         cat >&2 <<EOF
 NexusMessaging CLI
@@ -1233,7 +1640,7 @@ stdout: JSON only (pipeable to jq)
 stderr: human-readable tips and status messages
 
 Commands:
-  create [--ttl N] [--max-agents N] [--agent-id ID] [--creator-agent-id ID]
+  create [--verified-only] [--ttl N] [--max-agents N] [--agent-id ID] [--creator-agent-id ID]
                         Create session (default TTL: 3660s, maxAgents: 50)
   status <SESSION>                        Get session status
   join <SESSION> --agent-id ID            Join a session (saves agent-id + session key)
@@ -1244,7 +1651,7 @@ Commands:
   send <SESSION> "text" [--json PAYLOAD] [--strict] [--agent-id]
                         Send message (text and/or structured json; at least one required)
   poll <SESSION> [--after] [--members]    Poll messages (cursor auto-managed)
-  renew <SESSION> [--ttl N]              Renew session TTL
+  renew <SESSION> [--ttl N]              Renew with saved key; --ttl is creator-only
   poll-daemon <SESSION> [--interval N]    Poll with TTL tracking
   heartbeat <SESSION> [--interval N]      Continuous polling loop
   poll-status                              Show active polling processes
@@ -1268,6 +1675,10 @@ Tip: Use aliases to manage multiple sessions with short names.
   nexus.sh help alias             Show alias commands and usage
 
 Session data: ~/.config/messaging/sessions/<SESSION_ID>/
+
+Advanced (experimental):
+  webhook add|list|rm <SESSION> [...]  Manage session webhooks (creator only)
+  nexus.sh help webhook               Show webhook usage
 EOF
         ;;
     esac

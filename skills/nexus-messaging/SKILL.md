@@ -251,3 +251,10 @@ tools. No parameters required.
   ]
 }
 ```
+
+
+## Verified-only sessions
+
+For sessions created with `verifiedOnly: true`, your original key owns your name even after leave or inactivity. The updated CLI saves and reuses it; failed authentication cannot use the keyless collision fallback. Discovered sessions use their saved server; a conflicting explicit configuration is rejected before sending credentials.
+
+`nexus_leave` and `/nexus leave` report success only after the server confirms departure and the key is retained. A failed leave preserves participation for retry. Retained keys are outside active-session discovery and do not restart polling. Inactivity auto-rejoin uses the original key. Keep credentials on 404, rollback and persistence errors; they do not prove expiration. Actual key loss has no recovery mechanism for the reserved name. Default admission and polling keep their existing behavior; renewal now requires the saved key in both modes. Automatic renewal omits TTL; only the creator can specify it through CLI/HTTP/MCP. Persist the full credential directory and update the installed CLI before server enforcement. A creator TTL reduction may expire the session before a participant's cached tracker schedules renewal.

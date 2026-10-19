@@ -166,7 +166,7 @@ docker compose exec openclaw-gateway openclaw nexus-messaging status
 
 - **`nexus.sh` depends on `curl`.** The default OpenClaw Gateway image already has it. If you’re using a minimal custom image, install `curl` via `OPENCLAW_DOCKER_APT_PACKAGES="curl"`.
 - **Don’t mount the plugin read-only *and* write to its directory.** The plugin doesn’t — it writes the `jq` wrapper to `/tmp/nexus-messaging-bin/` and persists health to `/tmp/nexus-messaging-health.json`, both guaranteed writable in the container.
-- **Session data** (`~/.config/messaging/sessions/`) lives inside the container unless you mount a volume. If you want sessions joined via `nexus.sh` to survive restarts, mount `~/.config/messaging` to a named volume or host directory.
+- **Persistent credentials are required for renewal across recreation.** Mount the entire `~/.config/messaging` directory, including sessions, identities and policies, to a named volume or host directory under the same OS user. Restoring only agent IDs does not restore their keys.
 - **Agent sandbox (`OPENCLAW_SANDBOX=1`)** runs tools in disposable containers. NexusMessaging tools (`nexus_send`, etc.) are agent tools and will run inside the sandbox — they need `nexus.sh` reachable there too, which currently means avoiding sandbox for agents that use these tools, **or** baking the CLI into the sandbox image.
 
 ---
@@ -396,3 +396,24 @@ Shouldn’t happen — `jq` is bundled and wrapped under `/tmp/nexus-messaging-b
 ## License
 
 MIT — same as the NexusMessaging project.
+
+
+### Verified-only sessions
+
+The plugin can join sessions created with `verifiedOnly: true` using the updated CLI. The first admission saves proof before sending; later joins, polls, renewals and leaves reuse the original key. A reserved name cannot be recovered by the legacy keyless collision fallback. Inactivity auto-rejoin uses the same proof; authentication failure requires the original credential and does not silently obtain a new key.
+
+Discovered strict sessions contact their saved server even if the plugin default changes. If an explicit `config.sessions` entry and configured URL conflict with that saved server, the request fails before sending credentials. Keep the original binding or correct the configuration. A missing/404 strict session is unavailable, not proof that its credentials may be discarded.
+
+An anonymous strict session's saved policy also preserves its destination for status and first join without making it an active discovered session. CLI/MCP shared pending proofs remain available for retries, including after successful admission; leave retains them and the confirmed identity until explicit local purge.
+
+Both `nexus_leave` and `/nexus leave` temporarily pause background work for that session and drain any running poll, renewal or join before requesting departure. Messages returned by an already-running poll are buffered with its progress until the result is known: failed leave delivers the buffered messages once and resumes the tracker; confirmed leave discards the batch and removes polling state and aliases. Other sessions keep running. Retained records outside `sessions/` do not trigger discovery or polling on restart. Runtime and tool outputs omit protocol credential metadata, and errors redact known proof values. User message text and JSON remain unchanged, including checksum strings and credential-like field names. CLI storage guarantees cover process failures and lost responses; abrupt host/power loss remains a risk because the portable shell client does not require fsync.
+
+## Authenticated renewal compatibility
+
+Automatic renewal calls the installed CLI with the saved key and no `--ttl`; it uses the server's current stored TTL. This applies to default and verified-only sessions. Only the authenticated creator may explicitly change TTL through HTTP, CLI or MCP; the plugin adds no TTL-administration tool. Ownerless sessions can only renew without TTL.
+
+Upgrade the CLI used by the plugin before the enforcing server release. Older versions omit the key for default renewal, so they receive 401 while default polling may still work; without another successful renewal or message, the session expires. A default `agent_id_taken` fallback restores polling identity only. If its key is absent, the runtime reports that renewal is unavailable and instructs you to restore the complete credential volume. It cannot recover an active member's key or creator authority; strict IDs always require their original proof.
+
+Authentication, expiry, inactive membership, destination/mode mismatch and capacity errors skip the immediate renewal retry. Other errors, including strict persistence unavailability, retain one retry after approximately 300 ms with the same proof. Failure does not trigger rejoin or delete credentials. The existing scheduling sentinel is only used when expiry was unknown; later polling and renewal scheduling remain independent.
+
+A creator can reduce TTL without notifying another plugin's tracker. That participant may still hold an old expiry and fail to renew before the new server expiry. Receiving messages can also estimate expiry using a cached TTL. A successful renewal updates the tracker from the server, but this feature does not add periodic status refresh or guarantee timely renewal after an unseen reduction. Coordinate TTL reductions with participants.

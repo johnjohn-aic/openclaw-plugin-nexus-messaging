@@ -1,15 +1,17 @@
-import { RuntimeError } from "./runtime.js";
+import { RuntimeError, omitCredentialMetadata } from "./runtime.js";
 import type { Runtime } from "./runtime.js";
 import type { ServiceLoop } from "./service-loop.js";
 import { resolveAlias, writeAlias, removeAlias, readAliases, reverseAliasLookup } from "./aliases.js";
 
 function mcpOk(result: unknown) {
+  if (result && typeof result === "object" && (result as { verifiedOnly?: boolean }).verifiedOnly) result = omitCredentialMetadata(result);
   return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
 }
 
-function mcpError(err: unknown) {
+function mcpError(err: unknown, strict = false) {
   if (err instanceof RuntimeError) {
     return {
+      ...(strict ? { isError: true } : {}),
       content: [
         {
           type: "text" as const,
@@ -134,7 +136,7 @@ export function registerTools(
   api.registerTool(
     {
       name: "nexus_join",
-      description: "Join a NexusMessaging session. After joining, new messages will be delivered to you automatically via the background poll loop. Give it a label so you can refer to it by name instead of UUID.",
+      description: "Join a NexusMessaging session. After joining, new messages will be delivered to you automatically via the background poll loop. Verified sessions reuse your saved original key. Give it a label to use instead of the ID.",
       parameters: {
         type: "object",
         properties: {
@@ -162,7 +164,7 @@ export function registerTools(
   api.registerTool(
     {
       name: "nexus_leave",
-      description: "Leave a NexusMessaging session and stop receiving messages from it. Removes the session from your active list and deletes its alias. You can rejoin later with nexus_join if needed.",
+      description: "Leave a NexusMessaging session and stop receiving messages from it. Removes the session from your active list and deletes its alias. Verified sessions retain your original key for later nexus_join.",
       parameters: {
         type: "object",
         properties: {
@@ -172,14 +174,21 @@ export function registerTools(
       },
       async execute(_id: string, params: { sessionId: string }) {
         const sessionId = resolveAlias(params.sessionId);
-        serviceLoop.removeSession(sessionId);
-        removeAlias(sessionId);
+        const strict = runtime.isVerified?.(sessionId) === true;
+        if (!strict) { serviceLoop.removeSession(sessionId); removeAlias(sessionId); }
+        let resume: (() => void) | undefined;
         try {
+          if (strict) resume = await serviceLoop.pauseSession(sessionId);
           const result = await runtime.leave(sessionId);
+          if (strict) {
+            if (!result.ok) return mcpError(new RuntimeError("cli-error", "Strict leave was not confirmed", { sessionId }), true);
+            serviceLoop.removeSession(sessionId); removeAlias(sessionId);
+          }
           return mcpOk({ ...result, sessionId, polling: false });
         } catch (err: unknown) {
+          if (strict) return mcpError(err, true);
           return mcpOk({ sessionId, polling: false, serverLeave: "failed (session may be expired)" });
-        }
+        } finally { resume?.(); }
       },
     },
     { optional: true },
